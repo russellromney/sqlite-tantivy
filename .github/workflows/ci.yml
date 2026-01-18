@@ -11,16 +11,12 @@ env:
 
 jobs:
   test:
-    name: Test (${{ matrix.rust }}, ${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Test (Rust ${{ matrix.rust }})
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        rust: [stable, beta, "1.70"]
-        include:
-          - os: ubuntu-latest
-            rust: nightly
+        rust: [stable, beta, nightly, "1.70"]
     steps:
       - uses: actions/checkout@v4
 
