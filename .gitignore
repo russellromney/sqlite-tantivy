@@ -1,0 +1,23 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# SQLite
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Test artifacts
+/tmp/
