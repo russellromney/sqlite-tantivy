@@ -12,9 +12,7 @@ categories = ["database", "text-processing"]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Using forked version with INSERT fix until upstream PR is merged
-# See: https://github.com/asg017/sqlite-loadable-rs/pull/26
-sqlite-loadable = { git = "https://github.com/russellromney/sqlite-loadable-rs", branch = "fix-determine-update-operation-insert" }
+sqlite-loadable = "0.0.6-alpha.7"  # Requires fix from PR #26
 tantivy = "0.22"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
