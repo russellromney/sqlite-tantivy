@@ -47,6 +47,18 @@ show-lib:
 	@echo "Debug:   ./target/debug/libsqlite_tantivy.dylib"
 	@echo "Release: ./target/release/libsqlite_tantivy.dylib"
 
+# Run benchmarks (requires release build)
+bench: release
+	uv run benchmarks/bench.py --docs 10000 --queries 100
+
+# Run quick benchmark
+bench-quick: release
+	uv run benchmarks/bench.py --docs 1000 --queries 20
+
+# Run large benchmark
+bench-large: release
+	uv run benchmarks/bench.py --docs 100000 --queries 500 --output benchmarks/results.json
+
 help:
 	@echo "Available targets:"
 	@echo "  build           - Build debug version"
@@ -59,3 +71,6 @@ help:
 	@echo "  fmt             - Format code"
 	@echo "  check           - Full check (fmt + lint + test)"
 	@echo "  repl            - Load extension in sqlite3 CLI"
+	@echo "  bench           - Run benchmarks (10k docs)"
+	@echo "  bench-quick     - Quick benchmark (1k docs)"
+	@echo "  bench-large     - Large benchmark (100k docs)"
