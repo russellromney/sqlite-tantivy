@@ -12,7 +12,9 @@ categories = ["database", "text-processing"]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-sqlite-loadable = "0.0.6-alpha.6"
+# Using forked version with INSERT fix until upstream PR is merged
+# See: https://github.com/asg017/sqlite-loadable-rs/pull/26
+sqlite-loadable = { git = "https://github.com/russellromney/sqlite-loadable-rs", branch = "fix-determine-update-operation-insert" }
 tantivy = "0.22"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -30,8 +32,3 @@ tempfile = "3.0"
 [profile.release]
 lto = true
 codegen-units = 1
-
-# Patch sqlite-loadable to fix determine_update_operation bug
-# See: https://github.com/asg017/sqlite-loadable-rs/pull/26
-[patch.crates-io]
-sqlite-loadable = { path = "patches/sqlite-loadable" }
