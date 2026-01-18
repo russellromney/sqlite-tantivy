@@ -9,20 +9,7 @@ A SQLite extension that provides [Tantivy](https://github.com/quickwit-oss/tanti
 - **Rich query syntax**: Boolean operators, phrase search, fuzzy matching, field-scoped queries
 - **BM25 ranking**: Relevance-based result ordering
 - **Multiple field types**: TEXT, TAG, INTEGER, FLOAT
-- **Ecosystem compatible**: Indexes stored in SQLite (planned), works with Litestream
-
-## Current Status
-
-**Phase 1 Complete (Foundation)**:
-- Project structure and build system
-- SqliteDirectory for blob storage (not yet integrated)
-- Schema parser for virtual table definitions
-- Query parser supporting: terms, phrases, boolean (AND/OR/NOT), fuzzy (`~`), prefix (`*`), field-scoped
-
-**Work in Progress**:
-- Virtual table implementation (read-only search working)
-- Write support (INSERT/UPDATE/DELETE)
-- SqliteDirectory integration for single-file databases
+- **Single-file storage**: Indexes stored inside SQLite as BLOBs, works with Litestream
 
 ## Usage
 
@@ -37,11 +24,18 @@ CREATE VIRTUAL TABLE articles USING tantivy(
   author TEXT
 );
 
--- Search (once INSERT support is complete)
-SELECT * FROM articles WHERE articles MATCH 'hello world';
-SELECT * FROM articles WHERE articles MATCH 'title:rust AND body:performance';
-SELECT * FROM articles WHERE articles MATCH '"exact phrase"';
-SELECT * FROM articles WHERE articles MATCH 'helo~1';  -- fuzzy search
+-- Insert documents
+INSERT INTO articles(rowid, title, body, author) VALUES
+  (1, 'Hello World', 'An introduction to full-text search', 'Alice'),
+  (2, 'Rust Programming', 'Building fast systems with Rust', 'Bob');
+
+-- Search with MATCH syntax
+SELECT rowid, title FROM articles WHERE articles MATCH 'hello';
+SELECT rowid, title FROM articles WHERE articles MATCH 'title:rust';
+SELECT rowid, title FROM articles WHERE articles MATCH '"full-text search"';
+
+-- Delete documents
+DELETE FROM articles WHERE rowid = 1;
 ```
 
 ## Query Syntax
@@ -78,6 +72,15 @@ make repl
 - Rust 1.70+
 - SQLite with extension loading enabled
 
+## How It Works
+
+sqlite-tantivy stores Tantivy index segments directly in SQLite tables:
+
+- `_tantivy_indexes` - Index metadata and schema
+- `_tantivy_segments` - Binary segment data as BLOBs
+
+This enables single-file databases that work with backup tools like Litestream, and ensures the index stays in sync with your SQLite database.
+
 ## Architecture
 
 ```
@@ -92,6 +95,10 @@ sqlite-tantivy/
 └── tests/
 ```
 
+## Known Issues
+
+This extension requires a patched version of [sqlite-loadable-rs](https://github.com/asg017/sqlite-loadable-rs) to support INSERT with explicit rowid. See [PR #26](https://github.com/asg017/sqlite-loadable-rs/pull/26).
+
 ## Dependencies
 
 - [sqlite-loadable-rs](https://github.com/asg017/sqlite-loadable-rs) - SQLite extension framework
@@ -99,4 +106,4 @@ sqlite-tantivy/
 
 ## License
 
-MIT
+Apache-2.0
