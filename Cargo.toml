@@ -32,6 +32,6 @@ lto = true
 codegen-units = 1
 
 # Patch sqlite-loadable to fix determine_update_operation bug
-# See: https://github.com/asg017/sqlite-loadable-rs/issues/XX
+# See: https://github.com/asg017/sqlite-loadable-rs/pull/26
 [patch.crates-io]
 sqlite-loadable = { path = "patches/sqlite-loadable" }
