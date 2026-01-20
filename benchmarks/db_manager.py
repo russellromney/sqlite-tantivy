@@ -148,12 +148,10 @@ def generate_database(corpus_dir: Path, output_path: Path, engine: str,
     print(f"  Encryption: {'Yes' if encrypt else 'No'}")
     print()
 
-    conn = sqlite3.connect(str(output_path))
-
+    # Save extension info for later
     if engine == 'tantivy':
-        # Load tantivy extension
+        # Auto-detect extension path
         if not extension_path:
-            # Auto-detect extension path
             if sys.platform == "darwin":
                 extension_path = "./target/release/libsqlite_tantivy.dylib"
             elif sys.platform == "linux":
@@ -161,169 +159,146 @@ def generate_database(corpus_dir: Path, output_path: Path, engine: str,
             else:
                 extension_path = "./target/release/libsqlite_tantivy.dll"
 
-        # Remove extension for loading
-        ext_no_ext = extension_path.rsplit('.', 1)[0] if '.' in extension_path else extension_path
+    # Use DuckDB to create a temp table, then SQLite to copy into virtual table
+    print(f"  Using DuckDB to process Parquet → temp table → {engine.upper()} index...")
+    import time
+    start_time = time.time()
 
+    # Use DuckDB to create temporary database with regular table
+    temp_db_path = output_path.parent / f"_temp_{output_path.name}"
+    if temp_db_path.exists():
+        temp_db_path.unlink()
+
+    duckdb_conn = duckdb.connect()
+    print(f"      Installing DuckDB SQLite extension...")
+    duckdb_conn.execute("INSTALL sqlite")
+    print(f"      Loading DuckDB SQLite extension...")
+    duckdb_conn.execute("LOAD sqlite")
+    print(f"      DuckDB ready!")
+
+    # Build DuckDB query based on target size
+    if target_bytes < corpus_bytes:
+        sample_percent = (sample_ratio * 100)
+        print(f"    Sampling {sample_percent:.1f}% of documents...")
+        estimated_docs_needed = int(total_docs * sample_ratio)
+        if estimated_docs_needed == 0:
+            estimated_docs_needed = 1
+
+        # Determine how many Parquet files we need to read
+        # Each file is ~50MB text, ~781 docs per file on average
+        import glob
+        parquet_files = sorted(glob.glob(str(corpus_dir / "part-*.parquet")))
+        docs_per_file = total_docs / len(parquet_files)
+        files_needed = max(1, int(estimated_docs_needed / docs_per_file) + 1)
+
+        # Select random subset of files if we don't need them all
+        if files_needed < len(parquet_files):
+            import random
+            selected_files = random.sample(parquet_files, files_needed)
+            print(f"      Reading {files_needed} of {len(parquet_files)} Parquet files...")
+            # Create pattern for specific files
+            file_list = ", ".join([f"'{f}'" for f in selected_files])
+            query = f"""
+                ATTACH '{temp_db_path}' AS db (TYPE SQLITE);
+                CREATE TABLE db.articles AS
+                SELECT author, title, body
+                FROM read_parquet([{file_list}])
+                LIMIT {estimated_docs_needed};
+            """
+        else:
+            # Read all files
+            parquet_pattern = str(corpus_dir / "part-*.parquet")
+            query = f"""
+                ATTACH '{temp_db_path}' AS db (TYPE SQLITE);
+                CREATE TABLE db.articles AS
+                SELECT author, title, body
+                FROM read_parquet('{parquet_pattern}')
+                LIMIT {estimated_docs_needed};
+            """
+    elif target_bytes > corpus_bytes:
+        duplication_needed = int(target_bytes / corpus_bytes) + 1
+        print(f"    Duplicating corpus {duplication_needed} times...")
+        parquet_pattern = str(corpus_dir / "part-*.parquet")
+        union_parts = []
+        for i in range(duplication_needed):
+            if i == 0:
+                union_parts.append(f"SELECT author, title, body FROM read_parquet('{parquet_pattern}')")
+            else:
+                union_parts.append(f"SELECT author, title || ' (Copy {i})' as title, body FROM read_parquet('{parquet_pattern}')")
+
+        union_query = " UNION ALL ".join(union_parts)
+        query = f"""
+            ATTACH '{temp_db_path}' AS db (TYPE SQLITE);
+            CREATE TABLE db.articles AS {union_query};
+        """
+    else:
+        print(f"    Inserting full corpus...")
+        parquet_pattern = str(corpus_dir / "part-*.parquet")
+        query = f"""
+            ATTACH '{temp_db_path}' AS db (TYPE SQLITE);
+            CREATE TABLE db.articles AS
+            SELECT author, title, body
+            FROM read_parquet('{parquet_pattern}');
+        """
+
+    # Execute DuckDB query to create temp database
+    print(f"      Executing DuckDB query...")
+    duckdb_conn.execute(query)
+    print(f"      Query complete! Getting stats...")
+
+    # Get stats from temp table
+    result = duckdb_conn.execute("""
+        SELECT
+            COUNT(*) as doc_count,
+            COALESCE(SUM(LENGTH(author) + LENGTH(title) + LENGTH(body)), 0) as total_bytes
+        FROM db.articles
+    """).fetchone()
+
+    inserted_docs = result[0]
+    total_text_bytes = result[1] or 0
+    duckdb_conn.close()
+
+    print(f"    DuckDB created temp table: {inserted_docs:,} documents, {total_text_bytes / (1024*1024):.1f} MB")
+
+    # Now copy from temp database to virtual table using SQLite
+    print(f"    Copying to {engine.upper()} virtual table...")
+    conn = sqlite3.connect(str(output_path))
+
+    # Load extension and create virtual table
+    if engine == 'tantivy':
+        ext_no_ext = extension_path.rsplit('.', 1)[0] if '.' in extension_path else extension_path
         conn.enable_load_extension(True)
         try:
             conn.load_extension(ext_no_ext)
-            print(f"  Loaded extension: {extension_path}")
+            print(f"      Loaded extension: {extension_path}")
         except Exception as e:
             print(f"Error loading extension: {e}")
             print(f"Make sure to build first: make release")
             sys.exit(1)
-
-        # Create tantivy table
         conn.execute("CREATE VIRTUAL TABLE articles USING tantivy(author TEXT, title TEXT, body TEXT)")
     elif engine == 'fts5':
-        # Create FTS5 table
         conn.execute("CREATE VIRTUAL TABLE articles USING fts5(author, title, body)")
     else:
         print(f"Error: Unknown engine '{engine}'. Use 'tantivy' or 'fts5'")
         sys.exit(1)
 
-    # Insert documents using DuckDB (reads Parquet, writes to SQLite)
-    print(f"  Reading and bulk-inserting documents from Parquet files using DuckDB...")
-    import time
-    start_time = time.time()
+    # Attach temp database and copy data
+    conn.execute(f"ATTACH DATABASE '{temp_db_path}' AS source_db")
 
-    # Close SQLite connection, we'll use DuckDB to write to it
-    conn.close()
-
-    # Use DuckDB to read Parquet and insert into SQLite
-    duckdb_conn = duckdb.connect(':memory:')
-
-    # Attach SQLite database
-    duckdb_conn.execute(f"ATTACH '{output_path}' AS target (TYPE SQLITE)")
-
-    # Build parquet glob pattern
-    parquet_pattern = str(corpus_dir / "part-*.parquet")
-
-    inserted_docs = 0
-    total_text_bytes = 0
-
-    if target_bytes < corpus_bytes:
-        # Sampling - insert random subset
-        sample_percent = (sample_ratio * 100)
-        print(f"    Sampling {sample_percent:.1f}% of documents...")
-
-        if engine == 'tantivy':
-            # Tantivy needs explicit rowid
-            duckdb_conn.execute(f"""
-                INSERT INTO target.articles (rowid, author, title, body)
-                SELECT
-                    row_number() OVER () as rowid,
-                    author,
-                    title,
-                    body
-                FROM read_parquet('{parquet_pattern}')
-                WHERE random() < {sample_ratio}
-            """)
-        else:
-            # FTS5 auto-generates rowid
-            duckdb_conn.execute(f"""
-                INSERT INTO target.articles (author, title, body)
-                SELECT author, title, body
-                FROM read_parquet('{parquet_pattern}')
-                WHERE random() < {sample_ratio}
-            """)
-
-    elif target_bytes > corpus_bytes:
-        # Duplication - insert corpus multiple times
-        duplication_needed = int(target_bytes / corpus_bytes) + 1
-        print(f"    Duplicating corpus {duplication_needed} times to reach target size...")
-
-        for cycle in range(duplication_needed):
-            if cycle == 0:
-                # First pass - original data
-                if engine == 'tantivy':
-                    duckdb_conn.execute(f"""
-                        INSERT INTO target.articles (rowid, author, title, body)
-                        SELECT
-                            row_number() OVER () as rowid,
-                            author,
-                            title,
-                            body
-                        FROM read_parquet('{parquet_pattern}')
-                    """)
-                else:
-                    duckdb_conn.execute(f"""
-                        INSERT INTO target.articles (author, title, body)
-                        SELECT author, title, body
-                        FROM read_parquet('{parquet_pattern}')
-                    """)
-            else:
-                # Subsequent passes - mark as copies
-                if engine == 'tantivy':
-                    duckdb_conn.execute(f"""
-                        INSERT INTO target.articles (rowid, author, title, body)
-                        SELECT
-                            row_number() OVER () + {cycle * total_docs} as rowid,
-                            author,
-                            title || ' (Copy {cycle})',
-                            body
-                        FROM read_parquet('{parquet_pattern}')
-                    """)
-                else:
-                    duckdb_conn.execute(f"""
-                        INSERT INTO target.articles (author, title, body)
-                        SELECT
-                            author,
-                            title || ' (Copy {cycle})',
-                            body
-                        FROM read_parquet('{parquet_pattern}')
-                    """)
-
-            # Check if we've reached target
-            result = duckdb_conn.execute("SELECT COUNT(*) FROM target.articles").fetchone()
-            if result:
-                inserted_docs = result[0]
-                # Estimate size (we'll calculate exact size later)
-                estimated_size = (inserted_docs / total_docs) * corpus_bytes
-                print(f"    Inserted {inserted_docs:,} documents (~{estimated_size / (1024*1024):.0f} MB)...")
-                if estimated_size >= target_bytes:
-                    break
+    if engine == 'tantivy':
+        conn.execute("INSERT INTO articles(rowid, author, title, body) SELECT rowid, author, title, body FROM source_db.articles")
     else:
-        # Use full corpus
-        print(f"    Inserting full corpus...")
+        conn.execute("INSERT INTO articles(author, title, body) SELECT author, title, body FROM source_db.articles")
 
-        if engine == 'tantivy':
-            duckdb_conn.execute(f"""
-                INSERT INTO target.articles (rowid, author, title, body)
-                SELECT
-                    row_number() OVER () as rowid,
-                    author,
-                    title,
-                    body
-                FROM read_parquet('{parquet_pattern}')
-            """)
-        else:
-            duckdb_conn.execute(f"""
-                INSERT INTO target.articles (author, title, body)
-                SELECT author, title, body
-                FROM read_parquet('{parquet_pattern}')
-            """)
+    conn.commit()
+    conn.execute("DETACH DATABASE source_db")
 
-    # Get final counts
-    result = duckdb_conn.execute("SELECT COUNT(*) FROM target.articles").fetchone()
-    if result:
-        inserted_docs = result[0]
-
-    # Calculate actual text size
-    result = duckdb_conn.execute("""
-        SELECT SUM(length(author) + length(title) + length(body))
-        FROM target.articles
-    """).fetchone()
-    if result and result[0]:
-        total_text_bytes = result[0]
-
-    duckdb_conn.close()
+    # Clean up temp database
+    temp_db_path.unlink()
 
     insert_time = time.time() - start_time
     print(f"  Done! Index built in {insert_time:.2f}s ({inserted_docs/insert_time:.0f} docs/sec)")
 
-    # Reconnect with SQLite for metadata
-    conn = sqlite3.connect(str(output_path))
     total_text = total_text_bytes
 
     # Save metadata
