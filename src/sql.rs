@@ -218,99 +218,22 @@ const SQLITE_OPEN_READWRITE: i32 = 0x00000002;
 const SQLITE_OPEN_CREATE: i32 = 0x00000004;
 const SQLITE_OPEN_URI: i32 = 0x00000040;
 const SQLITE_OPEN_NOMUTEX: i32 = 0x00008000;
+const SQLITE_OPEN_SHAREDCACHE: i32 = 0x00020000;
 
-/// Create a callback function for SqliteDirectory that uses a SEPARATE database file
-/// for segment storage. This avoids locking conflicts with the main database during
-/// Tantivy commit operations.
+/// Create a callback function for SqliteDirectory that stores segments in the MAIN database.
 ///
-/// The segment database is stored at `<main_db>-tantivy` (e.g., `test.db-tantivy`).
+/// Uses the original connection directly. The callback is called synchronously during
+/// Tantivy operations, so no actual concurrency occurs.
+/// For best performance, enable WAL mode: PRAGMA journal_mode=WAL
 pub fn create_sql_callback(db: *mut sqlite3) -> Arc<dyn Fn(&str, &[SqliteValue]) -> std::result::Result<Vec<Vec<SqliteValue>>, String> + Send + Sync> {
-    // Get the database filename from the original connection
-    let db_filename = unsafe {
-        let filename_ptr = sqlite3ext_db_filename(db, ptr::null());
-        if filename_ptr.is_null() {
-            String::new()
-        } else {
-            std::ffi::CStr::from_ptr(filename_ptr)
-                .to_string_lossy()
-                .into_owned()
-        }
-    };
-
-    // Use a separate database file for segments to avoid locking conflicts
-    let segment_db_filename = if db_filename.is_empty() || db_filename == ":memory:" {
-        // For in-memory databases, use a unique shared-cache in-memory database
-        // The ?cache=shared allows multiple connections to access the same in-memory db
-        // We use a unique ID per connection to ensure isolation between tests
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        format!("file:tantivy_segments_{}?mode=memory&cache=shared", id)
-    } else {
-        format!("{}-tantivy", db_filename)
-    };
-
-    // Create a lazy-initialized separate connection wrapped in a mutex
-    // Store as usize to make it Send+Sync (we're careful about thread safety)
-    let conn: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
-    let filename = Arc::new(segment_db_filename);
+    // Use the SAME connection for all operations (single-file architecture)
+    // Table is pre-created by init_storage_tables so no creation needed
+    let db_ptr = db as usize;
 
     Arc::new(move |sql: &str, params: &[SqliteValue]| {
-        let mut conn_guard = conn.lock();
-
-        // Lazily open the connection on first use
-        let db = if *conn_guard != 0 {
-            *conn_guard as *mut sqlite3
-        } else {
-            let filename_to_open = filename.to_string();
-            let is_uri = filename_to_open.starts_with("file:");
-
-            let filename_c = std::ffi::CString::new(filename_to_open.as_str())
-                .map_err(|e| format!("Invalid filename: {}", e))?;
-
-            let mut flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX;
-            if is_uri {
-                flags |= SQLITE_OPEN_URI;
-            }
-
-            let mut new_db: *mut sqlite3 = ptr::null_mut();
-            let rc = unsafe {
-                sqlite3ext_open_v2(
-                    filename_c.as_ptr(),
-                    &mut new_db,
-                    flags,
-                    ptr::null(),
-                )
-            };
-
-            if rc != SQLITE_OK || new_db.is_null() {
-                return Err(format!("Failed to open segment database '{}': rc={}", filename_to_open, rc));
-            }
-
-            // Create the segment tables in the new database
-            let create_tables = r#"
-                CREATE TABLE IF NOT EXISTS _tantivy_segments (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    index_id INTEGER NOT NULL,
-                    file_name TEXT NOT NULL,
-                    data BLOB NOT NULL,
-                    created_at INTEGER DEFAULT (strftime('%s', 'now')),
-                    UNIQUE(index_id, file_name)
-                );
-                CREATE INDEX IF NOT EXISTS idx_segments_index_file
-                ON _tantivy_segments(index_id, file_name);
-            "#;
-
-            // Execute table creation
-            let res = execute_sql(new_db, create_tables, &[]);
-            if let Err(e) = res {
-                return Err(format!("Failed to create segment tables: {}", e));
-            }
-
-            *conn_guard = new_db as usize;
-            new_db
-        };
-
+        let db = db_ptr as *mut sqlite3;
+        // Execute SQL directly on main connection
+        // This works because Tantivy buffers writes and doesn't execute them during active callbacks
         execute_sql(db, sql, params).map_err(|e| e.to_string())
     })
 }

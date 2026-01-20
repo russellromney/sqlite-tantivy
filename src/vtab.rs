@@ -19,7 +19,7 @@ use sqlite_loadable::table::{
 };
 use sqlite_loadable::{api, Result};
 use tantivy::collector::TopDocs;
-use tantivy::schema::{Field, Value};
+use tantivy::schema::{Field, Schema, Value};
 use tantivy::{Index, IndexReader, IndexSettings, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 use crate::directory::{SqliteDirectory, SqliteValue, SCHEMA_SQL};
@@ -50,6 +50,8 @@ pub struct TantivyTable {
     table_name: String,
     /// SqliteDirectory for persistence
     directory: Option<SqliteDirectory>,
+    /// Tantivy schema (stored for lazy index initialization)
+    tantivy_schema: Option<Schema>,
     /// Count of uncommitted inserts (for batching commits)
     uncommitted_count: usize,
 }
@@ -91,6 +93,77 @@ impl TantivyTable {
         self.reader
             .as_ref()
             .ok_or_else(|| sqlite_loadable::Error::new_message("No index reader"))
+    }
+
+    /// Initialize index, writer, and reader lazily on first use
+    /// This avoids creating them during xConnect, which would cause deadlock with CREATE VIRTUAL TABLE
+    fn ensure_index_initialized(&mut self) -> Result<()> {
+        // If already initialized, return early
+        if self.index.is_some() {
+            return Ok(());
+        }
+
+        // Get directory and schema
+        let directory = self.directory.as_ref()
+            .ok_or_else(|| sqlite_loadable::Error::new_message("No directory"))?
+            .clone();
+
+        let tantivy_schema = self.tantivy_schema.as_ref()
+            .ok_or_else(|| sqlite_loadable::Error::new_message("No schema"))?
+            .clone();
+
+        // Try to open existing index, or create new one if it doesn't exist
+        // The _tantivy_segments table should already exist (created by init_storage_tables)
+        let index = match Index::open(directory.clone()) {
+            Ok(idx) => idx,
+            Err(_) => {
+                // Index doesn't exist - create new one
+                let idx = Index::create(directory.clone(), tantivy_schema.clone(), IndexSettings::default())
+                    .map_err(|e| sqlite_loadable::Error::new_message(format!("Failed to create index: {}", e)))?;
+
+                // Flush buffered writes to database after index creation
+                // Index::create() buffers writes to avoid reentrancy, now we can flush them
+                directory.flush()
+                    .map_err(|e| sqlite_loadable::Error::new_message(format!("Failed to flush buffered writes: {}", e)))?;
+
+                idx
+            }
+        };
+
+        // Create writer with 15MB heap (smaller for SQLite use case)
+        let writer = index
+            .writer(15_000_000)
+            .map_err(|e| sqlite_loadable::Error::new_message(e.to_string()))?;
+
+        // Create reader with manual reload policy (we'll reload after commits)
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .map_err(|e| sqlite_loadable::Error::new_message(e.to_string()))?;
+
+        // Setup default text fields for searching
+        if let Some(table_schema) = &self.table_schema {
+            for field_def in &table_schema.fields {
+                if field_def.field_type == FieldType::Text {
+                    if let Ok(field) = tantivy_schema.get_field(&field_def.name) {
+                        self.default_fields.push(field);
+                    }
+                }
+            }
+        }
+
+        let writer_arc = Arc::new(Mutex::new(writer));
+
+        // Register with global registry for tantivy_flush() access
+        crate::register_table(self.db, &self.table_name, writer_arc.clone(), reader.clone());
+
+        // Store in self
+        self.index = Some(index);
+        self.writer = Some(writer_arc);
+        self.reader = Some(reader);
+
+        Ok(())
     }
 
     /// Flush any uncommitted documents to disk
@@ -145,62 +218,23 @@ impl<'vtab> VTab<'vtab> for TantivyTable {
             .map_err(|e| sqlite_loadable::Error::new_message(e.to_string()))?;
 
         // Create SqliteDirectory with callback for database operations
+        // NOTE: We don't create the Index here to avoid deadlock with CREATE VIRTUAL TABLE
+        // The Index/writer/reader will be created lazily on first use (after table creation completes)
         let sql_callback = create_sql_callback(db);
         let sqlite_directory = SqliteDirectory::new(index_id, sql_callback.clone());
-
-        // Check if index already exists (has files) - uses segment db via callback
-        let has_segments = check_index_has_segments(&sql_callback, index_id)
-            .map_err(|e| sqlite_loadable::Error::new_message(e.to_string()))?;
-
-        // Create or open Tantivy index
-        let index = if has_segments {
-            // Open existing index
-            Index::open(sqlite_directory.clone())
-                .map_err(|e| sqlite_loadable::Error::new_message(e.to_string()))?
-        } else {
-            // Create new index
-            Index::create(sqlite_directory.clone(), tantivy_schema.clone(), IndexSettings::default())
-                .map_err(|e| sqlite_loadable::Error::new_message(e.to_string()))?
-        };
-
-        // Create writer with 15MB heap (smaller for SQLite use case)
-        let writer = index
-            .writer(15_000_000)
-            .map_err(|e| sqlite_loadable::Error::new_message(e.to_string()))?;
-
-        // Create reader with manual reload policy (we'll reload after commits)
-        let reader = index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::Manual)
-            .try_into()
-            .map_err(|e| sqlite_loadable::Error::new_message(e.to_string()))?;
-
-        // Get default text fields for searching
-        let mut default_fields = Vec::new();
-        for field_def in &table_schema.fields {
-            if field_def.field_type == FieldType::Text {
-                if let Ok(field) = tantivy_schema.get_field(&field_def.name) {
-                    default_fields.push(field);
-                }
-            }
-        }
-
-        let writer_arc = Arc::new(Mutex::new(writer));
-
-        // Register with global registry for tantivy_flush() access
-        crate::register_table(db, &table_name, writer_arc.clone(), reader.clone());
 
         let vtab = TantivyTable {
             base: unsafe { mem::zeroed() },
             db,
             index_id,
             table_schema: Some(table_schema),
-            index: Some(index),
-            writer: Some(writer_arc),
-            reader: Some(reader),
-            default_fields,
+            index: None,  // Will be created lazily on first use
+            writer: None,  // Will be created lazily on first use
+            reader: None,  // Will be created lazily on first use
+            default_fields: Vec::new(),  // Will be populated when index is initialized
             table_name,
             directory: Some(sqlite_directory),
+            tantivy_schema: Some(tantivy_schema),  // Store for lazy initialization
             uncommitted_count: 0,
         };
 
@@ -287,7 +321,9 @@ impl<'vtab> VTabWriteable<'vtab> for TantivyTable {
 
 impl<'vtab> VTabWriteableWithTransactions<'vtab> for TantivyTable {
     fn begin(&'vtab mut self) -> Result<()> {
-        // Nothing special needed at transaction start
+        // Initialize index lazily at transaction start (before any writes)
+        // This ensures the index is ready when INSERT/UPDATE/DELETE operations begin
+        self.ensure_index_initialized()?;
         Ok(())
     }
 
@@ -555,7 +591,11 @@ impl VTabCursor for TantivyCursor {
         // NOTE: Documents must be flushed via tantivy_flush('tablename') before querying
         // We can't flush here because Tantivy commit triggers SQL which deadlocks in callbacks
 
-        let table = unsafe { &*self.table };
+        // Get mutable reference to table to initialize index if needed
+        let table = unsafe { &mut *self.table };
+
+        // Ensure index is initialized (lazy initialization after CREATE VIRTUAL TABLE)
+        table.ensure_index_initialized()?;
 
         // Handle different query modes based on idx_num set in best_index
         match idx_num {
@@ -681,6 +721,22 @@ fn init_storage_tables(db: *mut sqlite3) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// Check if this is an in-memory database
+fn is_memory_database(db: *mut sqlite3) -> bool {
+    use std::ffi::CStr;
+    use std::ptr;
+    use sqlite_loadable::ext::sqlite3ext_db_filename;
+
+    unsafe {
+        let filename_ptr = sqlite3ext_db_filename(db, ptr::null());
+        if filename_ptr.is_null() {
+            return true;  // Null filename means in-memory
+        }
+        let filename = CStr::from_ptr(filename_ptr).to_string_lossy();
+        filename.is_empty() || filename == ":memory:"
+    }
+}
+
 /// Get or create index entry, returning the index ID
 fn get_or_create_index(db: *mut sqlite3, name: &str, schema_json: &str) -> crate::error::Result<i64> {
     // Try to find existing index
@@ -719,13 +775,4 @@ fn get_or_create_index(db: *mut sqlite3, name: &str, schema_json: &str) -> crate
             }
         })
         .ok_or_else(|| crate::error::Error::sqlite("Failed to get index ID"))
-}
-
-/// Check if an index has any segments stored (via the sql_callback to the segment database)
-fn check_index_has_segments(sql_callback: &crate::directory::SqlCallback, index_id: i64) -> crate::error::Result<bool> {
-    let results = sql_callback(
-        "SELECT 1 FROM _tantivy_segments WHERE index_id = ? LIMIT 1",
-        &[SqliteValue::Integer(index_id)],
-    ).map_err(|e| crate::error::Error::sqlite(e))?;
-    Ok(!results.is_empty())
 }

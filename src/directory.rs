@@ -7,10 +7,12 @@
 //! Uses a callback function for database operations to maintain compatibility with
 //! the SQLite connection used by the extension.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
+use parking_lot::Mutex;
 
 use tantivy::directory::{
     error::{DeleteError, OpenReadError, OpenWriteError},
@@ -27,6 +29,18 @@ CREATE TABLE IF NOT EXISTS _tantivy_indexes (
     schema TEXT NOT NULL,
     settings TEXT
 );
+
+CREATE TABLE IF NOT EXISTS _tantivy_segments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    index_id INTEGER NOT NULL,
+    file_name TEXT NOT NULL,
+    data BLOB NOT NULL,
+    created_at INTEGER DEFAULT (strftime('%s', 'now')),
+    UNIQUE(index_id, file_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_segments_index_file
+ON _tantivy_segments(index_id, file_name);
 "#;
 
 /// Simple value type for SQLite operations (used by vtab for queries)
@@ -73,10 +87,14 @@ pub type SqlCallback = Arc<dyn Fn(&str, &[SqliteValue]) -> std::result::Result<V
 
 /// Tantivy Directory implementation that stores files in SQLite BLOBs
 /// Uses a callback for database operations to work with the extension's connection
+/// Buffers writes to avoid reentrancy issues during index creation
 #[derive(Clone)]
 pub struct SqliteDirectory {
     index_id: i64,
     sql_callback: SqlCallback,
+    /// Write buffer: filename -> file data
+    /// Writes are buffered in memory until flush() is called
+    write_buffer: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 
 impl SqliteDirectory {
@@ -85,11 +103,21 @@ impl SqliteDirectory {
         Self {
             index_id,
             sql_callback,
+            write_buffer: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Read file data from SQLite
+    /// Read file data from buffer or SQLite
     fn read_file(&self, file_name: &str) -> Result<Vec<u8>> {
+        // Check buffer first (for uncommitted writes)
+        {
+            let buffer = self.write_buffer.lock();
+            if let Some(data) = buffer.get(file_name) {
+                return Ok(data.clone());
+            }
+        }
+
+        // Not in buffer, read from database
         let results = (self.sql_callback)(
             "SELECT data FROM _tantivy_segments WHERE index_id = ? AND file_name = ?",
             &[
@@ -108,16 +136,31 @@ impl SqliteDirectory {
         Err(Error::file_not_found(file_name))
     }
 
-    /// Write file data to SQLite
+    /// Write file data to buffer (actual write happens on flush)
     fn write_file(&self, file_name: &str, data: &[u8]) -> Result<()> {
-        (self.sql_callback)(
-            "INSERT OR REPLACE INTO _tantivy_segments (index_id, file_name, data) VALUES (?, ?, ?)",
-            &[
-                SqliteValue::Integer(self.index_id),
-                SqliteValue::Text(file_name.to_string()),
-                SqliteValue::Blob(data.to_vec()),
-            ],
-        ).map_err(|e| Error::sqlite(e))?;
+        // Buffer the write instead of executing SQL immediately
+        // This avoids reentrancy issues during index creation
+        let mut buffer = self.write_buffer.lock();
+        buffer.insert(file_name.to_string(), data.to_vec());
+        Ok(())
+    }
+
+    /// Flush all buffered writes to the database
+    pub fn flush(&self) -> Result<()> {
+        let mut buffer = self.write_buffer.lock();
+
+        // Write all buffered files to database
+        for (file_name, data) in buffer.drain() {
+            (self.sql_callback)(
+                "INSERT OR REPLACE INTO _tantivy_segments (index_id, file_name, data) VALUES (?, ?, ?)",
+                &[
+                    SqliteValue::Integer(self.index_id),
+                    SqliteValue::Text(file_name),
+                    SqliteValue::Blob(data),
+                ],
+            ).map_err(|e| Error::sqlite(e))?;
+        }
+
         Ok(())
     }
 
@@ -135,8 +178,17 @@ impl SqliteDirectory {
         Ok(true)
     }
 
-    /// Check if file exists in SQLite
+    /// Check if file exists in buffer or SQLite
     fn file_exists(&self, file_name: &str) -> Result<bool> {
+        // Check buffer first
+        {
+            let buffer = self.write_buffer.lock();
+            if buffer.contains_key(file_name) {
+                return Ok(true);
+            }
+        }
+
+        // Not in buffer, check database
         let results = (self.sql_callback)(
             "SELECT 1 FROM _tantivy_segments WHERE index_id = ? AND file_name = ? LIMIT 1",
             &[
