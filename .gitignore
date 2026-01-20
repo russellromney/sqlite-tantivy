@@ -9,6 +9,12 @@ Cargo.lock
 *.db-shm
 *.db-wal
 
+# Benchmark data
+benchmarks/corpus_*.pkl
+benchmarks/gutenberg_cache/
+benchmarks/*.json
+benchmarks/plots/
+
 # IDE
 .idea/
 .vscode/
