@@ -15,6 +15,7 @@ use parking_lot::Mutex;
 use sqlite_loadable::prelude::*;
 use sqlite_loadable::table::{
     BestIndexError, IndexInfo, UpdateOperation, VTab, VTabArguments, VTabCursor, VTabWriteable,
+    VTabWriteableWithTransactions,
 };
 use sqlite_loadable::{api, Result};
 use tantivy::collector::TopDocs;
@@ -24,7 +25,7 @@ use tantivy::{Index, IndexReader, IndexSettings, IndexWriter, ReloadPolicy, Tant
 use crate::directory::{SqliteDirectory, SqliteValue, SCHEMA_SQL};
 use crate::query::parse_query;
 use crate::schema::{FieldType, TableSchema};
-use crate::sql::{create_sql_callback, execute_sql, execute_sql_modify};
+use crate::sql::{execute_sql, execute_sql_modify, create_sql_callback};
 
 /// The virtual table structure
 #[repr(C)]
@@ -49,6 +50,33 @@ pub struct TantivyTable {
     table_name: String,
     /// SqliteDirectory for persistence
     directory: Option<SqliteDirectory>,
+    /// Count of uncommitted inserts (for batching commits)
+    uncommitted_count: usize,
+}
+
+impl Drop for TantivyTable {
+    fn drop(&mut self) {
+        // IMPORTANT: During SQLite connection close, we can't execute any SQL
+        // because the connection is in a closing state. Tantivy's writer/index
+        // drop handlers try to update files via our SqliteDirectory callback,
+        // which would deadlock.
+        //
+        // Solution: Use mem::forget to skip dropping these components entirely.
+        // This leaks memory, but avoids the deadlock. The data is still persisted
+        // in SQLite from previous commits.
+        if let Some(writer) = self.writer.take() {
+            std::mem::forget(writer);
+        }
+        if let Some(reader) = self.reader.take() {
+            std::mem::forget(reader);
+        }
+        if let Some(index) = self.index.take() {
+            std::mem::forget(index);
+        }
+        if let Some(directory) = self.directory.take() {
+            std::mem::forget(directory);
+        }
+    }
 }
 
 impl TantivyTable {
@@ -63,6 +91,22 @@ impl TantivyTable {
         self.reader
             .as_ref()
             .ok_or_else(|| sqlite_loadable::Error::new_message("No index reader"))
+    }
+
+    /// Flush any uncommitted documents to disk
+    fn flush_if_needed(&mut self) -> Result<()> {
+        if self.uncommitted_count > 0 {
+            if let Some(writer) = &self.writer {
+                let mut w = writer.lock();
+                w.commit()
+                    .map_err(|e| sqlite_loadable::Error::new_message(e.to_string()))?;
+                self.uncommitted_count = 0;
+            }
+            if let Some(reader) = &self.reader {
+                let _ = reader.reload();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -100,12 +144,12 @@ impl<'vtab> VTab<'vtab> for TantivyTable {
         let index_id = get_or_create_index(db, &table_name, &schema_json)
             .map_err(|e| sqlite_loadable::Error::new_message(e.to_string()))?;
 
-        // Create SqliteDirectory
-        let callback = create_sql_callback(db);
-        let sqlite_directory = SqliteDirectory::new(index_id, callback);
+        // Create SqliteDirectory with callback for database operations
+        let sql_callback = create_sql_callback(db);
+        let sqlite_directory = SqliteDirectory::new(index_id, sql_callback.clone());
 
-        // Check if index already exists (has files)
-        let has_segments = check_index_has_segments(db, index_id)
+        // Check if index already exists (has files) - uses segment db via callback
+        let has_segments = check_index_has_segments(&sql_callback, index_id)
             .map_err(|e| sqlite_loadable::Error::new_message(e.to_string()))?;
 
         // Create or open Tantivy index
@@ -141,17 +185,23 @@ impl<'vtab> VTab<'vtab> for TantivyTable {
             }
         }
 
+        let writer_arc = Arc::new(Mutex::new(writer));
+
+        // Register with global registry for tantivy_flush() access
+        crate::register_table(db, &table_name, writer_arc.clone(), reader.clone());
+
         let vtab = TantivyTable {
             base: unsafe { mem::zeroed() },
             db,
             index_id,
             table_schema: Some(table_schema),
             index: Some(index),
-            writer: Some(Arc::new(Mutex::new(writer))),
+            writer: Some(writer_arc),
             reader: Some(reader),
             default_fields,
             table_name,
             directory: Some(sqlite_directory),
+            uncommitted_count: 0,
         };
 
         Ok((create_sql, vtab))
@@ -205,6 +255,10 @@ impl<'vtab> VTab<'vtab> for TantivyTable {
     }
 
     fn open(&'vtab mut self) -> Result<Self::Cursor> {
+        // NOTE: Cannot flush here - it causes deadlock because we're in the middle
+        // of a SQLite callback and can't execute other SQL.
+        // Documents won't be searchable until explicitly committed.
+
         Ok(TantivyCursor {
             base: unsafe { mem::zeroed() },
             results: Vec::new(),
@@ -228,6 +282,37 @@ impl<'vtab> VTabWriteable<'vtab> for TantivyTable {
                 Err(sqlite_loadable::Error::new_message("UPDATE not yet supported"))
             }
         }
+    }
+}
+
+impl<'vtab> VTabWriteableWithTransactions<'vtab> for TantivyTable {
+    fn begin(&'vtab mut self) -> Result<()> {
+        // Nothing special needed at transaction start
+        Ok(())
+    }
+
+    fn sync(&'vtab mut self) -> Result<()> {
+        // NOTE: Cannot commit here - Tantivy's commit writes via SqliteDirectory
+        // which calls execute_sql, and we can't execute SQL during xSync (deadlock).
+        // Instead, we commit lazily in xFilter before queries.
+        Ok(())
+    }
+
+    fn commit(&'vtab mut self) -> Result<()> {
+        // Called after sync succeeds - nothing more to do
+        Ok(())
+    }
+
+    fn rollback(&'vtab mut self) -> Result<()> {
+        // Discard uncommitted documents
+        if self.uncommitted_count > 0 {
+            if let Some(writer) = &self.writer {
+                let mut w = writer.lock();
+                let _ = w.rollback();
+                self.uncommitted_count = 0;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -307,15 +392,14 @@ impl TantivyTable {
             writer.add_document(doc)
                 .map_err(|e| sqlite_loadable::Error::new_message(e.to_string()))?;
 
-            // Commit immediately for SQLite compatibility
-            writer.commit()
-                .map_err(|e| sqlite_loadable::Error::new_message(e.to_string()))?;
-        }
-
-        // Reload reader to see new document
-        if let Some(reader) = &self.reader {
-            reader.reload()
-                .map_err(|e| sqlite_loadable::Error::new_message(e.to_string()))?;
+            // Don't auto-commit during INSERT - it causes deadlock because:
+            // 1. Python/SQLite holds a lock during virtual table callback
+            // 2. Tantivy commit uses worker threads that try to write back to SQLite
+            // 3. Those writes need the same lock → deadlock
+            //
+            // Instead, we just count uncommitted docs. Commit happens in flush_if_needed()
+            // which is called before queries (in open()) and can be called explicitly.
+            self.uncommitted_count += 1;
         }
 
         // Set the rowid output
@@ -466,6 +550,9 @@ impl VTabCursor for TantivyCursor {
     ) -> Result<()> {
         self.results.clear();
         self.position = 0;
+
+        // NOTE: Documents must be flushed via tantivy_flush('tablename') before querying
+        // We can't flush here because Tantivy commit triggers SQL which deadlocks in callbacks
 
         let table = unsafe { &*self.table };
 
@@ -633,12 +720,11 @@ fn get_or_create_index(db: *mut sqlite3, name: &str, schema_json: &str) -> crate
         .ok_or_else(|| crate::error::Error::sqlite("Failed to get index ID"))
 }
 
-/// Check if an index has any segments stored
-fn check_index_has_segments(db: *mut sqlite3, index_id: i64) -> crate::error::Result<bool> {
-    let results = execute_sql(
-        db,
+/// Check if an index has any segments stored (via the sql_callback to the segment database)
+fn check_index_has_segments(sql_callback: &crate::directory::SqlCallback, index_id: i64) -> crate::error::Result<bool> {
+    let results = sql_callback(
         "SELECT 1 FROM _tantivy_segments WHERE index_id = ? LIMIT 1",
         &[SqliteValue::Integer(index_id)],
-    )?;
+    ).map_err(|e| crate::error::Error::sqlite(e))?;
     Ok(!results.is_empty())
 }

@@ -1,9 +1,9 @@
 //! SQL execution helpers for sqlite-tantivy
 //!
-//! Provides SQL execution with blob support using SQLite's hex literal syntax.
-//! This works around sqlite-loadable not exposing bind_blob.
+//! Provides SQL execution with proper parameter binding for efficient blob handling.
 
 use std::ffi::CString;
+use std::os::raw::{c_int, c_void};
 use std::ptr;
 use std::sync::Arc;
 
@@ -11,7 +11,10 @@ use sqlite_loadable::ext::{
     sqlite3, sqlite3_stmt, sqlite3ext_finalize, sqlite3ext_prepare_v2, sqlite3ext_step,
     sqlite3ext_column_value, sqlite3ext_value_bytes, sqlite3ext_value_int64,
     sqlite3ext_value_text, sqlite3ext_value_blob, sqlite3ext_value_type,
+    sqlite3ext_bind_int64, sqlite3ext_bind_text, sqlite3ext_bind_blob, sqlite3ext_bind_null,
+    sqlite3ext_open_v2, sqlite3ext_db_filename,
 };
+use parking_lot::Mutex;
 
 use crate::directory::SqliteValue;
 use crate::error::{Error, Result};
@@ -29,55 +32,49 @@ const SQLITE_TEXT: i32 = 3;
 const SQLITE_BLOB: i32 = 4;
 const SQLITE_NULL: i32 = 5;
 
-/// Helper to encode bytes as hex string
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02X}", b)).collect()
+/// SQLite destructor type
+type SqliteDestructor = Option<unsafe extern "C" fn(*mut c_void)>;
+
+/// SQLITE_TRANSIENT equivalent (-1) - tells SQLite to copy the data immediately
+fn sqlite_transient() -> SqliteDestructor {
+    // SQLITE_TRANSIENT is defined as ((sqlite3_destructor_type)-1) in SQLite
+    // We need to transmute -1isize to a function pointer
+    unsafe { std::mem::transmute::<isize, SqliteDestructor>(-1) }
 }
 
-/// Build SQL with parameters embedded (using SQLite's quoting rules)
-/// This is necessary because sqlite-loadable doesn't expose bind_blob
-fn build_sql_with_params(template: &str, params: &[SqliteValue]) -> String {
-    let mut result = template.to_string();
-
-    for (idx, param) in params.iter().enumerate().rev() {
-        let value_str = match param {
-            SqliteValue::Null => "NULL".to_string(),
-            SqliteValue::Integer(v) => v.to_string(),
+/// Bind parameters to a prepared statement using proper parameter binding
+unsafe fn bind_params(stmt: *mut sqlite3_stmt, params: &[SqliteValue]) -> Result<()> {
+    for (idx, param) in params.iter().enumerate() {
+        let param_idx = (idx + 1) as c_int; // SQLite params are 1-indexed
+        let rc = match param {
+            SqliteValue::Null => sqlite3ext_bind_null(stmt, param_idx),
+            SqliteValue::Integer(v) => sqlite3ext_bind_int64(stmt, param_idx, *v),
             SqliteValue::Text(s) => {
-                // Escape single quotes by doubling them
-                let escaped = s.replace('\'', "''");
-                format!("'{}'", escaped)
+                // bind_text needs a C string pointer, length, and destructor
+                // SQLITE_TRANSIENT tells SQLite to make its own copy of the data
+                sqlite3ext_bind_text(
+                    stmt,
+                    param_idx,
+                    s.as_ptr() as *const i8,
+                    s.len() as c_int,
+                    sqlite_transient(),
+                )
             }
             SqliteValue::Blob(data) => {
-                // Use SQLite hex literal syntax: X'HEXDATA'
-                format!("X'{}'", hex_encode(data))
+                sqlite3ext_bind_blob(
+                    stmt,
+                    param_idx,
+                    data.as_ptr() as *const c_void,
+                    data.len() as c_int,
+                    sqlite_transient(),
+                )
             }
         };
-
-        // Find and replace the idx-th occurrence (from start)
-        let mut count = 0;
-        let mut new_result = String::new();
-        let mut chars = result.chars().peekable();
-        let mut replaced = false;
-
-        while let Some(c) = chars.next() {
-            if c == '?' && !replaced {
-                if count == idx {
-                    new_result.push_str(&value_str);
-                    replaced = true;
-                } else {
-                    new_result.push(c);
-                }
-                count += 1;
-            } else {
-                new_result.push(c);
-            }
+        if rc != SQLITE_OK {
+            return Err(Error::sqlite(format!("Failed to bind parameter {}: rc={}", idx, rc)));
         }
-
-        result = new_result;
     }
-
-    result
+    Ok(())
 }
 
 /// Execute SQL and return results
@@ -86,19 +83,16 @@ pub fn execute_sql(
     sql: &str,
     params: &[SqliteValue],
 ) -> Result<Vec<Vec<SqliteValue>>> {
-    // Build SQL with embedded parameters
-    let final_sql = build_sql_with_params(sql, params);
-
     unsafe {
-        // Prepare statement
-        let c_sql = CString::new(final_sql.as_str())
+        // Prepare statement with placeholders
+        let c_sql = CString::new(sql)
             .map_err(|_| Error::sqlite("Invalid SQL string"))?;
         let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
 
         let rc = sqlite3ext_prepare_v2(
             db,
             c_sql.as_ptr(),
-            final_sql.len() as i32,
+            sql.len() as i32,
             &mut stmt,
             ptr::null_mut(),
         );
@@ -106,9 +100,12 @@ pub fn execute_sql(
         if rc != SQLITE_OK {
             return Err(Error::sqlite(format!(
                 "Failed to prepare statement (rc={}): {}",
-                rc, final_sql
+                rc, sql
             )));
         }
+
+        // Bind parameters
+        bind_params(stmt, params)?;
 
         // Execute and collect results
         let mut results = Vec::new();
@@ -216,63 +213,104 @@ pub fn execute_sql_modify(
     Ok(())
 }
 
-/// Create a callback function for SqliteDirectory that uses a db pointer
+/// SQLite open flags
+const SQLITE_OPEN_READWRITE: i32 = 0x00000002;
+const SQLITE_OPEN_CREATE: i32 = 0x00000004;
+const SQLITE_OPEN_URI: i32 = 0x00000040;
+const SQLITE_OPEN_NOMUTEX: i32 = 0x00008000;
+
+/// Create a callback function for SqliteDirectory that uses a SEPARATE database file
+/// for segment storage. This avoids locking conflicts with the main database during
+/// Tantivy commit operations.
+///
+/// The segment database is stored at `<main_db>-tantivy` (e.g., `test.db-tantivy`).
 pub fn create_sql_callback(db: *mut sqlite3) -> Arc<dyn Fn(&str, &[SqliteValue]) -> std::result::Result<Vec<Vec<SqliteValue>>, String> + Send + Sync> {
-    let db_ptr = db as usize; // Store as usize to make it Send + Sync
+    // Get the database filename from the original connection
+    let db_filename = unsafe {
+        let filename_ptr = sqlite3ext_db_filename(db, ptr::null());
+        if filename_ptr.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(filename_ptr)
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+
+    // Use a separate database file for segments to avoid locking conflicts
+    let segment_db_filename = if db_filename.is_empty() || db_filename == ":memory:" {
+        // For in-memory databases, use a unique shared-cache in-memory database
+        // The ?cache=shared allows multiple connections to access the same in-memory db
+        // We use a unique ID per connection to ensure isolation between tests
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!("file:tantivy_segments_{}?mode=memory&cache=shared", id)
+    } else {
+        format!("{}-tantivy", db_filename)
+    };
+
+    // Create a lazy-initialized separate connection wrapped in a mutex
+    // Store as usize to make it Send+Sync (we're careful about thread safety)
+    let conn: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let filename = Arc::new(segment_db_filename);
 
     Arc::new(move |sql: &str, params: &[SqliteValue]| {
-        let db = db_ptr as *mut sqlite3;
+        let mut conn_guard = conn.lock();
+
+        // Lazily open the connection on first use
+        let db = if *conn_guard != 0 {
+            *conn_guard as *mut sqlite3
+        } else {
+            let filename_to_open = filename.to_string();
+            let is_uri = filename_to_open.starts_with("file:");
+
+            let filename_c = std::ffi::CString::new(filename_to_open.as_str())
+                .map_err(|e| format!("Invalid filename: {}", e))?;
+
+            let mut flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX;
+            if is_uri {
+                flags |= SQLITE_OPEN_URI;
+            }
+
+            let mut new_db: *mut sqlite3 = ptr::null_mut();
+            let rc = unsafe {
+                sqlite3ext_open_v2(
+                    filename_c.as_ptr(),
+                    &mut new_db,
+                    flags,
+                    ptr::null(),
+                )
+            };
+
+            if rc != SQLITE_OK || new_db.is_null() {
+                return Err(format!("Failed to open segment database '{}': rc={}", filename_to_open, rc));
+            }
+
+            // Create the segment tables in the new database
+            let create_tables = r#"
+                CREATE TABLE IF NOT EXISTS _tantivy_segments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    index_id INTEGER NOT NULL,
+                    file_name TEXT NOT NULL,
+                    data BLOB NOT NULL,
+                    created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                    UNIQUE(index_id, file_name)
+                );
+                CREATE INDEX IF NOT EXISTS idx_segments_index_file
+                ON _tantivy_segments(index_id, file_name);
+            "#;
+
+            // Execute table creation
+            let res = execute_sql(new_db, create_tables, &[]);
+            if let Err(e) = res {
+                return Err(format!("Failed to create segment tables: {}", e));
+            }
+
+            *conn_guard = new_db as usize;
+            new_db
+        };
+
         execute_sql(db, sql, params).map_err(|e| e.to_string())
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_hex_encode() {
-        let data = b"hello";
-        let hex = hex_encode(data);
-        assert_eq!(hex, "68656C6C6F");
-    }
-
-    #[test]
-    fn test_build_sql_simple() {
-        let sql = "SELECT * FROM t WHERE id = ?";
-        let result = build_sql_with_params(sql, &[SqliteValue::Integer(42)]);
-        assert_eq!(result, "SELECT * FROM t WHERE id = 42");
-    }
-
-    #[test]
-    fn test_build_sql_text() {
-        let sql = "INSERT INTO t (name) VALUES (?)";
-        let result = build_sql_with_params(sql, &[SqliteValue::Text("hello".to_string())]);
-        assert_eq!(result, "INSERT INTO t (name) VALUES ('hello')");
-    }
-
-    #[test]
-    fn test_build_sql_text_escape() {
-        let sql = "INSERT INTO t (name) VALUES (?)";
-        let result = build_sql_with_params(sql, &[SqliteValue::Text("it's".to_string())]);
-        assert_eq!(result, "INSERT INTO t (name) VALUES ('it''s')");
-    }
-
-    #[test]
-    fn test_build_sql_blob() {
-        let sql = "INSERT INTO t (data) VALUES (?)";
-        let result = build_sql_with_params(sql, &[SqliteValue::Blob(vec![0x48, 0x65, 0x6C])]);
-        assert_eq!(result, "INSERT INTO t (data) VALUES (X'48656C')");
-    }
-
-    #[test]
-    fn test_build_sql_multiple() {
-        let sql = "INSERT INTO t (a, b, c) VALUES (?, ?, ?)";
-        let result = build_sql_with_params(sql, &[
-            SqliteValue::Integer(1),
-            SqliteValue::Text("hello".to_string()),
-            SqliteValue::Blob(vec![0xAB, 0xCD]),
-        ]);
-        assert_eq!(result, "INSERT INTO t (a, b, c) VALUES (1, 'hello', X'ABCD')");
-    }
 }

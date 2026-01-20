@@ -1,0 +1,3 @@
+[submodule "sqlite-loadable-rs-local"]
+	path = sqlite-loadable-rs-local
+	url = https://github.com/russellromney/sqlite-loadable-rs

@@ -85,6 +85,9 @@ fn test_insert_and_search() {
         [],
     ).expect("Failed to insert document 3");
 
+    // Flush to make documents searchable
+    let _: i32 = conn.query_row("SELECT tantivy_flush('articles')", [], |row| row.get(0)).unwrap();
+
     // Search for 'hello' - should find docs 1 and 3
     let mut stmt = conn
         .prepare("SELECT rowid, title FROM articles WHERE articles MATCH 'hello'")
@@ -130,6 +133,9 @@ fn test_phrase_search() {
         [],
     ).unwrap();
 
+    // Flush to make documents searchable
+    let _: i32 = conn.query_row("SELECT tantivy_flush('docs')", [], |row| row.get(0)).unwrap();
+
     // Phrase search should only match doc 1
     let mut stmt = conn
         .prepare("SELECT rowid FROM docs WHERE docs MATCH '\"quick brown\"'")
@@ -158,12 +164,15 @@ fn test_delete() {
     conn.execute("INSERT INTO docs(rowid, title) VALUES (1, 'Hello')", []).unwrap();
     conn.execute("INSERT INTO docs(rowid, title) VALUES (2, 'World')", []).unwrap();
 
-    // Verify both exist
+    // Flush to make documents searchable
+    let _: i32 = conn.query_row("SELECT tantivy_flush('docs')", [], |row| row.get(0)).unwrap();
+
+    // Verify doc 1 exists
     let mut stmt = conn.prepare("SELECT rowid FROM docs WHERE docs MATCH 'hello'").unwrap();
     let results: Vec<i64> = stmt.query_map([], |row| row.get(0)).unwrap().filter_map(|r| r.ok()).collect();
-    assert_eq!(results.len(), 1);
+    assert_eq!(results.len(), 1, "Expected 1 result before delete");
 
-    // Delete doc 1
+    // Delete doc 1 (delete includes commit + reload)
     conn.execute("DELETE FROM docs WHERE rowid = 1", []).unwrap();
 
     // Verify it's gone
@@ -182,7 +191,7 @@ fn test_storage_tables_created() {
         [],
     ).unwrap();
 
-    // Check that _tantivy_indexes table exists
+    // Check that _tantivy_indexes table exists in main database
     let count: i32 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_tantivy_indexes'",
@@ -191,16 +200,9 @@ fn test_storage_tables_created() {
         )
         .unwrap();
 
-    assert_eq!(count, 1, "_tantivy_indexes table should exist");
+    assert_eq!(count, 1, "_tantivy_indexes table should exist in main database");
 
-    // Check that _tantivy_segments table exists
-    let count: i32 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_tantivy_segments'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-
-    assert_eq!(count, 1, "_tantivy_segments table should exist");
+    // Note: _tantivy_segments table is now stored in a separate database file
+    // (e.g., mydb.db-tantivy) to avoid locking conflicts during Tantivy commit operations.
+    // For in-memory databases, the segment storage is also in-memory (not accessible).
 }
