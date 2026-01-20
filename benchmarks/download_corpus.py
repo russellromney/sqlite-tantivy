@@ -174,6 +174,74 @@ def generate_corpus(target_size_mb: float, cache_dir: Path) -> List[Tuple[str, s
     return corpus
 
 
+def generate_corpus_streaming(target_size_mb: float, cache_dir: Path):
+    """
+    Generate a corpus using a streaming/generator approach to avoid loading everything in memory.
+
+    Yields batches of documents instead of returning a full list.
+
+    Args:
+        target_size_mb: Target size in megabytes
+        cache_dir: Directory to cache downloaded texts
+
+    Yields:
+        Batches of (author, title, text) tuples
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    current_size = 0
+    target_bytes = int(target_size_mb * 1024 * 1024)
+    total_docs = 0
+
+    # Download texts until we reach target size
+    for ebook_id, author, title in GUTENBERG_TEXTS:
+        if current_size >= target_bytes:
+            break
+
+        author_clean, title_clean, text = download_gutenberg_text(ebook_id, author, title, cache_dir)
+
+        if text:
+            # Split large texts into chapters/sections for more realistic documents
+            sections = split_into_sections(text, author_clean, title_clean)
+
+            text_size = sum(len(a) + len(t) + len(txt) for a, t, txt in sections)
+            current_size += text_size
+            total_docs += len(sections)
+
+            print(f"  Added {len(sections)} sections, {text_size / (1024*1024):.2f} MB")
+            print(f"  Total size: {current_size / (1024*1024):.2f} MB / {target_size_mb} MB")
+
+            # Yield this batch
+            yield sections
+
+    # If we need more, repeat texts with chapter markers
+    cycle = 1
+    while current_size < target_bytes:
+        for ebook_id, author, title in GUTENBERG_TEXTS:
+            if current_size >= target_bytes:
+                break
+
+            cache_file = cache_dir / f"{ebook_id}.txt"
+            if not cache_file.exists():
+                continue
+
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                text = f.read()
+
+            sections = split_into_sections(text, f"{author} (Cycle {cycle})", title)
+
+            text_size = sum(len(a) + len(t) + len(txt) for a, t, txt in sections)
+            current_size += text_size
+            total_docs += len(sections)
+
+            # Yield this batch
+            yield sections
+
+        cycle += 1
+
+    print(f"\nFinal corpus: {total_docs} documents, {current_size / (1024*1024):.2f} MB")
+
+
 def split_into_sections(text: str, author: str, title: str, section_size: int = 2000) -> List[Tuple[str, str, str]]:
     """
     Split a large text into sections for more realistic document sizes.

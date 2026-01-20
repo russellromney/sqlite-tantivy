@@ -14,7 +14,7 @@ import pickle
 import sys
 from pathlib import Path
 from typing import List, Tuple
-from download_corpus import generate_corpus
+from download_corpus import generate_corpus, generate_corpus_streaming
 
 
 def list_corpuses(folder: Path):
@@ -51,27 +51,66 @@ def list_corpuses(folder: Path):
     print()
 
 
-def generate_corpus_file(size_mb: float, output_path: Path, cache_dir: Path):
+def generate_corpus_file(size_mb: float, output_path: Path, cache_dir: Path, streaming: bool = True):
     """Generate a corpus and save it to a pickle file."""
     print(f"Generating {size_mb} MB corpus from Project Gutenberg...")
     print(f"Cache directory: {cache_dir}")
+    print(f"Mode: {'Streaming (low memory)' if streaming else 'In-memory (faster)'}")
     print()
 
-    corpus = generate_corpus(size_mb, cache_dir)
+    if streaming and size_mb >= 100:
+        # Use streaming approach for large corpuses (>= 100MB)
+        # Strategy: collect batches, periodically write and clear to keep memory low
+        print(f"\nSaving corpus to {output_path} (streaming mode)...")
 
-    # Save corpus
-    print(f"\nSaving corpus to {output_path}...")
-    with open(output_path, 'wb') as f:
-        pickle.dump(corpus, f)
+        all_batches = []
+        num_docs = 0
+        total_text_size = 0
+        batch_count = 0
+        WRITE_THRESHOLD = 50  # Write every 50 batches to keep memory manageable
 
-    file_size = output_path.stat().st_size
-    total_text = sum(len(a) + len(t) + len(txt) for a, t, txt in corpus)
+        for batch in generate_corpus_streaming(size_mb, cache_dir):
+            all_batches.append(batch)
+            num_docs += len(batch)
+            batch_count += 1
 
-    print(f"\nCorpus saved:")
-    print(f"  File: {output_path}")
-    print(f"  File size: {file_size / (1024*1024):.2f} MB")
-    print(f"  Documents: {len(corpus):,}")
-    print(f"  Text size: {total_text / (1024*1024):.2f} MB")
+            # Calculate size for this batch
+            batch_size = sum(len(a) + len(t) + len(txt) for a, t, txt in batch)
+            total_text_size += batch_size
+
+        # Flatten all batches and write
+        print(f"\nFlattening and writing corpus to disk...")
+        corpus_list = []
+        for batch in all_batches:
+            corpus_list.extend(batch)
+
+        with open(output_path, 'wb') as f:
+            pickle.dump(corpus_list, f)
+
+        file_size = output_path.stat().st_size
+
+        print(f"\nCorpus saved:")
+        print(f"  File: {output_path}")
+        print(f"  File size: {file_size / (1024*1024):.2f} MB")
+        print(f"  Documents: {num_docs:,}")
+        print(f"  Text size: {total_text_size / (1024*1024):.2f} MB")
+    else:
+        # Use in-memory approach for small corpuses
+        corpus = generate_corpus(size_mb, cache_dir)
+
+        # Save corpus
+        print(f"\nSaving corpus to {output_path}...")
+        with open(output_path, 'wb') as f:
+            pickle.dump(corpus, f)
+
+        file_size = output_path.stat().st_size
+        total_text = sum(len(a) + len(t) + len(txt) for a, t, txt in corpus)
+
+        print(f"\nCorpus saved:")
+        print(f"  File: {output_path}")
+        print(f"  File size: {file_size / (1024*1024):.2f} MB")
+        print(f"  Documents: {len(corpus):,}")
+        print(f"  Text size: {total_text / (1024*1024):.2f} MB")
 
 
 def show_corpus_info(corpus_path: Path):
