@@ -17,9 +17,9 @@ from pathlib import Path
 from typing import List, Tuple, Dict
 
 try:
-    import pyarrow.parquet as pq
+    import duckdb
 except ImportError:
-    print("Error: pyarrow is required. Install with: pip install pyarrow")
+    print("Error: duckdb is required. Install with: pip install duckdb")
     sys.exit(1)
 
 
@@ -182,101 +182,149 @@ def generate_database(corpus_dir: Path, output_path: Path, engine: str,
         print(f"Error: Unknown engine '{engine}'. Use 'tantivy' or 'fts5'")
         sys.exit(1)
 
-    # Insert documents in batches from Parquet files
-    print(f"  Reading and inserting documents from Parquet files...")
+    # Insert documents using DuckDB (reads Parquet, writes to SQLite)
+    print(f"  Reading and bulk-inserting documents from Parquet files using DuckDB...")
     import time
-    import random
     start_time = time.time()
 
-    parquet_files = sorted(corpus_dir.glob("part-*.parquet"))
+    # Close SQLite connection, we'll use DuckDB to write to it
+    conn.close()
+
+    # Use DuckDB to read Parquet and insert into SQLite
+    duckdb_conn = duckdb.connect(':memory:')
+
+    # Attach SQLite database
+    duckdb_conn.execute(f"ATTACH '{output_path}' AS target (TYPE SQLITE)")
+
+    # Build parquet glob pattern
+    parquet_pattern = str(corpus_dir / "part-*.parquet")
+
     inserted_docs = 0
-    current_size = 0
-    rowid = 1
+    total_text_bytes = 0
 
-    for pq_file in parquet_files:
-        # Read file in batches
-        table = pq.read_table(pq_file)
-        df = table.to_pandas()
+    if target_bytes < corpus_bytes:
+        # Sampling - insert random subset
+        sample_percent = (sample_ratio * 100)
+        print(f"    Sampling {sample_percent:.1f}% of documents...")
 
-        for _, row in df.iterrows():
-            author, title, body = row['author'], row['title'], row['body']
+        if engine == 'tantivy':
+            # Tantivy needs explicit rowid
+            duckdb_conn.execute(f"""
+                INSERT INTO target.articles (rowid, author, title, body)
+                SELECT
+                    row_number() OVER () as rowid,
+                    author,
+                    title,
+                    body
+                FROM read_parquet('{parquet_pattern}')
+                WHERE random() < {sample_ratio}
+            """)
+        else:
+            # FTS5 auto-generates rowid
+            duckdb_conn.execute(f"""
+                INSERT INTO target.articles (author, title, body)
+                SELECT author, title, body
+                FROM read_parquet('{parquet_pattern}')
+                WHERE random() < {sample_ratio}
+            """)
 
-            # Check if we should include this document
-            if target_bytes < corpus_bytes:
-                # Sampling - randomly skip some documents
-                if random.random() > sample_ratio:
-                    continue
+    elif target_bytes > corpus_bytes:
+        # Duplication - insert corpus multiple times
+        duplication_needed = int(target_bytes / corpus_bytes) + 1
+        print(f"    Duplicating corpus {duplication_needed} times to reach target size...")
 
-            # Insert document
-            if engine == 'tantivy':
-                conn.execute(
-                    "INSERT INTO articles(rowid, author, title, body) VALUES (?, ?, ?, ?)",
-                    (rowid, author, title, body)
-                )
-            else:  # fts5
-                conn.execute(
-                    "INSERT INTO articles(author, title, body) VALUES (?, ?, ?)",
-                    (author, title, body)
-                )
+        for cycle in range(duplication_needed):
+            if cycle == 0:
+                # First pass - original data
+                if engine == 'tantivy':
+                    duckdb_conn.execute(f"""
+                        INSERT INTO target.articles (rowid, author, title, body)
+                        SELECT
+                            row_number() OVER () as rowid,
+                            author,
+                            title,
+                            body
+                        FROM read_parquet('{parquet_pattern}')
+                    """)
+                else:
+                    duckdb_conn.execute(f"""
+                        INSERT INTO target.articles (author, title, body)
+                        SELECT author, title, body
+                        FROM read_parquet('{parquet_pattern}')
+                    """)
+            else:
+                # Subsequent passes - mark as copies
+                if engine == 'tantivy':
+                    duckdb_conn.execute(f"""
+                        INSERT INTO target.articles (rowid, author, title, body)
+                        SELECT
+                            row_number() OVER () + {cycle * total_docs} as rowid,
+                            author,
+                            title || ' (Copy {cycle})',
+                            body
+                        FROM read_parquet('{parquet_pattern}')
+                    """)
+                else:
+                    duckdb_conn.execute(f"""
+                        INSERT INTO target.articles (author, title, body)
+                        SELECT
+                            author,
+                            title || ' (Copy {cycle})',
+                            body
+                        FROM read_parquet('{parquet_pattern}')
+                    """)
 
-            inserted_docs += 1
-            rowid += 1
-            current_size += len(author) + len(title) + len(body)
-
-            # Stop if we've reached target size
-            if current_size >= target_bytes:
-                break
-
-        # Commit periodically
-        if inserted_docs % 5000 == 0:
-            conn.commit()
-            print(f"    Inserted {inserted_docs:,} documents, {current_size / (1024*1024):.1f} MB...")
-
-        if current_size >= target_bytes:
-            break
-
-    # Handle duplication if needed
-    if target_bytes > corpus_bytes and current_size < target_bytes:
-        print(f"  Duplicating documents to reach target size...")
-        cycle = 1
-        while current_size < target_bytes:
-            for pq_file in parquet_files:
-                table = pq.read_table(pq_file)
-                df = table.to_pandas()
-
-                for _, row in df.iterrows():
-                    author, title, body = row['author'], f"{row['title']} (Copy {cycle})", row['body']
-
-                    if engine == 'tantivy':
-                        conn.execute(
-                            "INSERT INTO articles(rowid, author, title, body) VALUES (?, ?, ?, ?)",
-                            (rowid, author, title, body)
-                        )
-                    else:
-                        conn.execute(
-                            "INSERT INTO articles(author, title, body) VALUES (?, ?, ?)",
-                            (author, title, body)
-                        )
-
-                    inserted_docs += 1
-                    rowid += 1
-                    current_size += len(author) + len(title) + len(body)
-
-                    if current_size >= target_bytes:
-                        break
-
-                if current_size >= target_bytes:
+            # Check if we've reached target
+            result = duckdb_conn.execute("SELECT COUNT(*) FROM target.articles").fetchone()
+            if result:
+                inserted_docs = result[0]
+                # Estimate size (we'll calculate exact size later)
+                estimated_size = (inserted_docs / total_docs) * corpus_bytes
+                print(f"    Inserted {inserted_docs:,} documents (~{estimated_size / (1024*1024):.0f} MB)...")
+                if estimated_size >= target_bytes:
                     break
+    else:
+        # Use full corpus
+        print(f"    Inserting full corpus...")
 
-            cycle += 1
+        if engine == 'tantivy':
+            duckdb_conn.execute(f"""
+                INSERT INTO target.articles (rowid, author, title, body)
+                SELECT
+                    row_number() OVER () as rowid,
+                    author,
+                    title,
+                    body
+                FROM read_parquet('{parquet_pattern}')
+            """)
+        else:
+            duckdb_conn.execute(f"""
+                INSERT INTO target.articles (author, title, body)
+                SELECT author, title, body
+                FROM read_parquet('{parquet_pattern}')
+            """)
 
-    # Final commit
-    conn.commit()
+    # Get final counts
+    result = duckdb_conn.execute("SELECT COUNT(*) FROM target.articles").fetchone()
+    if result:
+        inserted_docs = result[0]
+
+    # Calculate actual text size
+    result = duckdb_conn.execute("""
+        SELECT SUM(length(author) + length(title) + length(body))
+        FROM target.articles
+    """).fetchone()
+    if result and result[0]:
+        total_text_bytes = result[0]
+
+    duckdb_conn.close()
 
     insert_time = time.time() - start_time
     print(f"  Done! Index built in {insert_time:.2f}s ({inserted_docs/insert_time:.0f} docs/sec)")
 
-    total_text = current_size
+    # Reconnect with SQLite for metadata
+    conn = sqlite3.connect(str(output_path))
+    total_text = total_text_bytes
 
     # Save metadata
     metadata = {
@@ -335,7 +383,7 @@ def show_database_info(db_path: Path):
         if row:
             metadata = json.loads(row[0])
             print("Metadata (from database):")
-            print(f"  Corpus file: {metadata['corpus_file']}")
+            print(f"  Corpus dir: {metadata['corpus_dir']}")
             print(f"  Documents: {metadata['corpus_documents']:,}")
             print(f"  Corpus text size: {metadata['corpus_size_mb']:.2f} MB")
 
