@@ -10,7 +10,7 @@ Cargo.lock
 *.db-wal
 
 # Benchmark data
-benchmarks/corpus_*.pkl
+benchmarks/corpus_*/
 benchmarks/gutenberg_cache/
 benchmarks/*.json
 benchmarks/plots/

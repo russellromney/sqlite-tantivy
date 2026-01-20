@@ -11,11 +11,16 @@ Commands:
 import argparse
 import json
 import os
-import pickle
 import sqlite3
 import sys
 from pathlib import Path
 from typing import List, Tuple, Dict
+
+try:
+    import pyarrow.parquet as pq
+except ImportError:
+    print("Error: pyarrow is required. Install with: pip install pyarrow")
+    sys.exit(1)
 
 
 def parse_db_name(db_path: Path) -> Dict[str, str]:
@@ -79,10 +84,10 @@ def list_databases(folder: Path):
     print()
 
 
-def generate_database(corpus_path: Path, output_path: Path, engine: str,
+def generate_database(corpus_dir: Path, output_path: Path, engine: str,
                      extension_path: str, compress: bool, encrypt: bool,
                      target_size_mb: float = None):
-    """Generate a benchmark database from a corpus file."""
+    """Generate a benchmark database from a corpus directory (streaming, low memory)."""
     # Check for compression/encryption support FIRST (fail early)
     if compress or encrypt:
         compress_vfs_path = Path(__file__).parent.parent / "sqlite-compress-vfs"
@@ -95,73 +100,46 @@ def generate_database(corpus_path: Path, output_path: Path, engine: str,
             print(f"  3. Re-run this command")
             sys.exit(1)
 
-    if not corpus_path.exists():
-        print(f"Error: Corpus file {corpus_path} does not exist")
+    if not corpus_dir.exists() or not corpus_dir.is_dir():
+        print(f"Error: Corpus directory {corpus_dir} does not exist")
         print(f"\nAvailable corpuses:")
         os.system(f"python3 {Path(__file__).parent / 'corpus_manager.py'} list")
         sys.exit(1)
 
-    # Load corpus
-    print(f"Loading corpus from {corpus_path}...")
-    with open(corpus_path, 'rb') as f:
-        corpus = pickle.load(f)
+    # Load corpus metadata
+    metadata_file = corpus_dir / "_metadata.json"
+    if not metadata_file.exists():
+        print(f"Error: Metadata file not found in {corpus_dir}")
+        sys.exit(1)
 
-    print(f"  Loaded {len(corpus):,} documents from corpus")
-    corpus_text_size = sum(len(a) + len(t) + len(txt) for a, t, txt in corpus)
-    print(f"  Corpus text size: {corpus_text_size / (1024*1024):.2f} MB")
+    with open(metadata_file) as f:
+        corpus_metadata = json.load(f)
 
-    # Adjust corpus to reach target size if specified
-    if target_size_mb:
-        target_bytes = target_size_mb * 1024 * 1024
+    corpus_text_size_mb = corpus_metadata['text_size_mb']
+    total_docs = corpus_metadata['num_documents']
 
-        if target_bytes > corpus_text_size:
-            # Need to duplicate documents
-            print(f"  Target DB size: {target_size_mb:.0f} MB (larger than corpus)")
-            print(f"  Duplicating documents to reach target size...")
+    print(f"Corpus: {corpus_dir}")
+    print(f"  Documents: {total_docs:,}")
+    print(f"  Text size: {corpus_text_size_mb:.2f} MB")
+    print()
 
-            working_corpus = list(corpus)  # Start with original
-            current_size = corpus_text_size
-            cycle = 1
+    # Determine sampling/duplication strategy
+    if not target_size_mb:
+        target_size_mb = corpus_text_size_mb
 
-            while current_size < target_bytes:
-                for doc in corpus:
-                    if current_size >= target_bytes:
-                        break
-                    author, title, text = doc
-                    # Add cycle marker to title for variety
-                    working_corpus.append((author, f"{title} (Copy {cycle})", text))
-                    current_size += len(author) + len(title) + len(text)
-                cycle += 1
+    target_bytes = target_size_mb * 1024 * 1024
+    corpus_bytes = corpus_text_size_mb * 1024 * 1024
 
-            corpus = working_corpus
-            final_size = sum(len(a) + len(t) + len(txt) for a, t, txt in corpus)
-            print(f"  Final corpus: {len(corpus):,} documents, {final_size / (1024*1024):.2f} MB")
+    if target_bytes < corpus_bytes:
+        print(f"Target size: {target_size_mb:.0f} MB (sampling from corpus)")
+        sample_ratio = target_bytes / corpus_bytes
+    elif target_bytes > corpus_bytes:
+        print(f"Target size: {target_size_mb:.0f} MB (duplicating corpus)")
+        duplication_needed = int(target_bytes / corpus_bytes) + 1
+    else:
+        print(f"Target size: {target_size_mb:.0f} MB (using full corpus)")
+        sample_ratio = 1.0
 
-        elif target_bytes < corpus_text_size:
-            # Need to sample documents
-            print(f"  Target DB size: {target_size_mb:.0f} MB (smaller than corpus)")
-            print(f"  Sampling documents to reach target size...")
-
-            import random
-            sampled = []
-            current_size = 0
-            shuffled = list(corpus)
-            random.shuffle(shuffled)
-
-            for doc in shuffled:
-                if current_size >= target_bytes:
-                    break
-                sampled.append(doc)
-                author, title, text = doc
-                current_size += len(author) + len(title) + len(text)
-
-            corpus = sampled
-            final_size = sum(len(a) + len(t) + len(txt) for a, t, txt in corpus)
-            print(f"  Sampled corpus: {len(corpus):,} documents, {final_size / (1024*1024):.2f} MB")
-        else:
-            print(f"  Target size matches corpus size: {target_size_mb:.0f} MB")
-
-    total_text = sum(len(a) + len(t) + len(txt) for a, t, txt in corpus)
     print()
 
     # Create database
@@ -197,57 +175,117 @@ def generate_database(corpus_path: Path, output_path: Path, engine: str,
 
         # Create tantivy table
         conn.execute("CREATE VIRTUAL TABLE articles USING tantivy(author TEXT, title TEXT, body TEXT)")
-
-        # Insert all documents using executemany
-        print(f"  Inserting {len(corpus):,} documents and building index...")
-        import time
-        start_time = time.time()
-
-        # Prepare all data
-        data = [(i+1, author, title, text) for i, (author, title, text) in enumerate(corpus)]
-
-        # Bulk insert
-        conn.executemany(
-            "INSERT INTO articles(rowid, author, title, body) VALUES (?, ?, ?, ?)",
-            data
-        )
-
-        insert_time = time.time() - start_time
-        print(f"  Done! Index built in {insert_time:.2f}s ({len(corpus)/insert_time:.0f} docs/sec)")
-
     elif engine == 'fts5':
         # Create FTS5 table
         conn.execute("CREATE VIRTUAL TABLE articles USING fts5(author, title, body)")
-
-        # Insert all documents using executemany
-        print(f"  Inserting {len(corpus):,} documents and building index...")
-        import time
-        start_time = time.time()
-
-        # Bulk insert
-        conn.executemany(
-            "INSERT INTO articles(author, title, body) VALUES (?, ?, ?)",
-            corpus
-        )
-
-        insert_time = time.time() - start_time
-        print(f"  Done! Index built in {insert_time:.2f}s ({len(corpus)/insert_time:.0f} docs/sec)")
-
     else:
         print(f"Error: Unknown engine '{engine}'. Use 'tantivy' or 'fts5'")
         sys.exit(1)
 
-    # Commit the single transaction
+    # Insert documents in batches from Parquet files
+    print(f"  Reading and inserting documents from Parquet files...")
+    import time
+    import random
+    start_time = time.time()
+
+    parquet_files = sorted(corpus_dir.glob("part-*.parquet"))
+    inserted_docs = 0
+    current_size = 0
+    rowid = 1
+
+    for pq_file in parquet_files:
+        # Read file in batches
+        table = pq.read_table(pq_file)
+        df = table.to_pandas()
+
+        for _, row in df.iterrows():
+            author, title, body = row['author'], row['title'], row['body']
+
+            # Check if we should include this document
+            if target_bytes < corpus_bytes:
+                # Sampling - randomly skip some documents
+                if random.random() > sample_ratio:
+                    continue
+
+            # Insert document
+            if engine == 'tantivy':
+                conn.execute(
+                    "INSERT INTO articles(rowid, author, title, body) VALUES (?, ?, ?, ?)",
+                    (rowid, author, title, body)
+                )
+            else:  # fts5
+                conn.execute(
+                    "INSERT INTO articles(author, title, body) VALUES (?, ?, ?)",
+                    (author, title, body)
+                )
+
+            inserted_docs += 1
+            rowid += 1
+            current_size += len(author) + len(title) + len(body)
+
+            # Stop if we've reached target size
+            if current_size >= target_bytes:
+                break
+
+        # Commit periodically
+        if inserted_docs % 5000 == 0:
+            conn.commit()
+            print(f"    Inserted {inserted_docs:,} documents, {current_size / (1024*1024):.1f} MB...")
+
+        if current_size >= target_bytes:
+            break
+
+    # Handle duplication if needed
+    if target_bytes > corpus_bytes and current_size < target_bytes:
+        print(f"  Duplicating documents to reach target size...")
+        cycle = 1
+        while current_size < target_bytes:
+            for pq_file in parquet_files:
+                table = pq.read_table(pq_file)
+                df = table.to_pandas()
+
+                for _, row in df.iterrows():
+                    author, title, body = row['author'], f"{row['title']} (Copy {cycle})", row['body']
+
+                    if engine == 'tantivy':
+                        conn.execute(
+                            "INSERT INTO articles(rowid, author, title, body) VALUES (?, ?, ?, ?)",
+                            (rowid, author, title, body)
+                        )
+                    else:
+                        conn.execute(
+                            "INSERT INTO articles(author, title, body) VALUES (?, ?, ?)",
+                            (author, title, body)
+                        )
+
+                    inserted_docs += 1
+                    rowid += 1
+                    current_size += len(author) + len(title) + len(body)
+
+                    if current_size >= target_bytes:
+                        break
+
+                if current_size >= target_bytes:
+                    break
+
+            cycle += 1
+
+    # Final commit
     conn.commit()
 
-    # Save metadata (insert_time is defined in both branches above)
+    insert_time = time.time() - start_time
+    print(f"  Done! Index built in {insert_time:.2f}s ({inserted_docs/insert_time:.0f} docs/sec)")
+
+    total_text = current_size
+
+    # Save metadata
     metadata = {
-        'corpus_file': str(corpus_path),
-        'corpus_documents': len(corpus),
+        'corpus_dir': str(corpus_dir),
+        'corpus_documents': inserted_docs,
         'corpus_size_mb': total_text / (1024 * 1024),
         'target_size_mb': target_size_mb if target_size_mb else total_text / (1024 * 1024),
         'index_build_time_sec': insert_time,
-        'index_build_docs_per_sec': len(corpus) / insert_time if insert_time > 0 else 0,
+        'index_build_docs_per_sec': inserted_docs / insert_time if insert_time > 0 else 0,
         'engine': engine,
         'compressed': compress,
         'encrypted': encrypt,
@@ -341,7 +379,7 @@ def main():
     # Generate command
     gen_parser = subparsers.add_parser('generate', help='Generate a benchmark database')
     gen_parser.add_argument('--corpus', type=Path, required=True,
-                           help='Corpus file to use')
+                           help='Corpus directory to use')
     gen_parser.add_argument('--engine', choices=['tantivy', 'fts5'], required=True,
                            help='Search engine to use')
     gen_parser.add_argument('--db-size', type=float,
@@ -375,7 +413,7 @@ def main():
             if args.db_size:
                 base_name = f"db_{int(args.db_size)}mb"
             else:
-                base_name = args.corpus.stem  # e.g., "corpus_10mb"
+                base_name = args.corpus.name  # e.g., "corpus_5000mb"
 
             flags = []
             if args.compress:
@@ -387,7 +425,7 @@ def main():
             parts.extend(flags)
             output_name = '_'.join(parts) + '.db'
 
-            args.output = args.corpus.parent / output_name
+            args.output = Path('benchmarks') / output_name
 
         generate_database(args.corpus, args.output, args.engine,
                          args.extension, args.compress, args.encrypt,

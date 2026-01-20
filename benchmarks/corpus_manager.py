@@ -10,144 +10,198 @@ Commands:
 
 import argparse
 import json
-import pickle
 import sys
 from pathlib import Path
 from typing import List, Tuple
-from download_corpus import generate_corpus, generate_corpus_streaming
+from download_corpus import generate_corpus_streaming
+
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+except ImportError:
+    print("Error: pyarrow is required. Install with: pip install pyarrow")
+    sys.exit(1)
 
 
 def list_corpuses(folder: Path):
-    """List all corpus files in the specified folder."""
-    corpus_files = sorted(folder.glob("corpus_*.pkl"))
+    """List all corpus directories in the specified folder."""
+    corpus_dirs = sorted([d for d in folder.iterdir() if d.is_dir() and d.name.startswith("corpus_")])
 
-    if not corpus_files:
-        print(f"No corpus files found in {folder}")
+    if not corpus_dirs:
+        print(f"No corpus directories found in {folder}")
         print(f"\nGenerate a corpus with:")
-        print(f"  python corpus_manager.py generate --size 10 --output {folder}")
+        print(f"  python corpus_manager.py generate --size 10 --folder {folder}")
         return
 
     print(f"Available corpuses in {folder}:")
     print()
-    print(f"{'Filename':<30} {'Size':<12} {'Documents':<12} {'Total Size'}")
-    print("-" * 80)
+    print(f"{'Corpus':<40} {'Files':<8} {'Total Size':<12} {'Documents':<12} {'Text Size'}")
+    print("-" * 100)
 
-    for corpus_file in corpus_files:
+    for corpus_dir in corpus_dirs:
         try:
-            with open(corpus_file, 'rb') as f:
-                corpus = pickle.load(f)
+            # Read metadata
+            metadata_file = corpus_dir / "_metadata.json"
+            if metadata_file.exists():
+                with open(metadata_file) as f:
+                    metadata = json.load(f)
 
-            file_size = corpus_file.stat().st_size
-            num_docs = len(corpus)
+                parquet_files = list(corpus_dir.glob("part-*.parquet"))
+                total_size = sum(f.stat().st_size for f in parquet_files)
 
-            # Calculate total text size
-            total_size = sum(len(author) + len(title) + len(text)
-                           for author, title, text in corpus)
-
-            print(f"{corpus_file.name:<30} {file_size / (1024*1024):>10.2f} MB {num_docs:>10,} {total_size / (1024*1024):>10.2f} MB")
+                print(f"{corpus_dir.name:<40} {len(parquet_files):>6} {total_size / (1024*1024):>10.2f} MB "
+                      f"{metadata['num_documents']:>10,} {metadata['text_size_mb']:>10.2f} MB")
+            else:
+                print(f"{corpus_dir.name:<40} No metadata found")
         except Exception as e:
-            print(f"{corpus_file.name:<30} ERROR: {e}")
+            print(f"{corpus_dir.name:<40} ERROR: {e}")
 
     print()
 
 
-def generate_corpus_file(size_mb: float, output_path: Path, cache_dir: Path, streaming: bool = True):
-    """Generate a corpus and save it to a pickle file."""
+def generate_corpus_file(size_mb: float, output_dir: Path, cache_dir: Path, file_size_mb: float = 50):
+    """Generate a corpus and save as multiple Parquet files (streaming, low memory)."""
     print(f"Generating {size_mb} MB corpus from Project Gutenberg...")
     print(f"Cache directory: {cache_dir}")
-    print(f"Mode: {'Streaming (low memory)' if streaming else 'In-memory (faster)'}")
+    print(f"Output directory: {output_dir}")
+    print(f"File size target: ~{file_size_mb} MB per file")
     print()
 
-    if streaming and size_mb >= 100:
-        # Use streaming approach for large corpuses (>= 100MB)
-        # Strategy: collect batches, periodically write and clear to keep memory low
-        print(f"\nSaving corpus to {output_path} (streaming mode)...")
+    # Create output directory
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-        all_batches = []
-        num_docs = 0
-        total_text_size = 0
-        batch_count = 0
-        WRITE_THRESHOLD = 50  # Write every 50 batches to keep memory manageable
+    # Define schema
+    schema = pa.schema([
+        ('author', pa.string()),
+        ('title', pa.string()),
+        ('body', pa.string())
+    ])
 
-        for batch in generate_corpus_streaming(size_mb, cache_dir):
-            all_batches.append(batch)
-            num_docs += len(batch)
-            batch_count += 1
+    print(f"Writing Parquet files in {file_size_mb}MB chunks...")
+    num_docs = 0
+    total_text_size = 0
+    file_num = 0
+    current_batch_docs = []
+    current_batch_size = 0
+    target_file_bytes = file_size_mb * 1024 * 1024
 
-            # Calculate size for this batch
-            batch_size = sum(len(a) + len(t) + len(txt) for a, t, txt in batch)
-            total_text_size += batch_size
+    # Stream batches and write to Parquet files
+    for batch in generate_corpus_streaming(size_mb, cache_dir):
+        for doc in batch:
+            author, title, body = doc
+            current_batch_docs.append(doc)
+            current_batch_size += len(author) + len(title) + len(body)
+            num_docs += 1
+            total_text_size += len(author) + len(title) + len(body)
 
-        # Flatten all batches and write
-        print(f"\nFlattening and writing corpus to disk...")
-        corpus_list = []
-        for batch in all_batches:
-            corpus_list.extend(batch)
+            # Write file when we hit target size
+            if current_batch_size >= target_file_bytes:
+                # Write Parquet file
+                output_file = output_dir / f"part-{file_num:05d}.parquet"
+                table = pa.Table.from_pydict({
+                    'author': [d[0] for d in current_batch_docs],
+                    'title': [d[1] for d in current_batch_docs],
+                    'body': [d[2] for d in current_batch_docs]
+                }, schema=schema)
 
-        with open(output_path, 'wb') as f:
-            pickle.dump(corpus_list, f)
+                pq.write_table(table, output_file, compression='zstd')
 
-        file_size = output_path.stat().st_size
+                file_size = output_file.stat().st_size
+                print(f"  File {file_num}: {len(current_batch_docs):,} docs, "
+                      f"{current_batch_size / (1024*1024):.1f} MB text → "
+                      f"{file_size / (1024*1024):.1f} MB compressed")
 
-        print(f"\nCorpus saved:")
-        print(f"  File: {output_path}")
-        print(f"  File size: {file_size / (1024*1024):.2f} MB")
-        print(f"  Documents: {num_docs:,}")
-        print(f"  Text size: {total_text_size / (1024*1024):.2f} MB")
-    else:
-        # Use in-memory approach for small corpuses
-        corpus = generate_corpus(size_mb, cache_dir)
+                file_num += 1
+                current_batch_docs = []
+                current_batch_size = 0
 
-        # Save corpus
-        print(f"\nSaving corpus to {output_path}...")
-        with open(output_path, 'wb') as f:
-            pickle.dump(corpus, f)
+    # Write remaining documents
+    if current_batch_docs:
+        output_file = output_dir / f"part-{file_num:05d}.parquet"
+        table = pa.Table.from_pydict({
+            'author': [d[0] for d in current_batch_docs],
+            'title': [d[1] for d in current_batch_docs],
+            'body': [d[2] for d in current_batch_docs]
+        }, schema=schema)
 
-        file_size = output_path.stat().st_size
-        total_text = sum(len(a) + len(t) + len(txt) for a, t, txt in corpus)
+        pq.write_table(table, output_file, compression='zstd')
 
-        print(f"\nCorpus saved:")
-        print(f"  File: {output_path}")
-        print(f"  File size: {file_size / (1024*1024):.2f} MB")
-        print(f"  Documents: {len(corpus):,}")
-        print(f"  Text size: {total_text / (1024*1024):.2f} MB")
+        file_size = output_file.stat().st_size
+        print(f"  File {file_num}: {len(current_batch_docs):,} docs, "
+              f"{current_batch_size / (1024*1024):.1f} MB text → "
+              f"{file_size / (1024*1024):.1f} MB compressed")
+
+    # Save metadata
+    metadata = {
+        'size_mb': size_mb,
+        'num_documents': num_docs,
+        'text_size_mb': total_text_size / (1024 * 1024),
+        'num_files': file_num + 1,
+        'file_size_mb': file_size_mb
+    }
+
+    with open(output_dir / "_metadata.json", 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+    # Calculate total compressed size
+    parquet_files = list(output_dir.glob("part-*.parquet"))
+    total_compressed = sum(f.stat().st_size for f in parquet_files)
+
+    print(f"\nCorpus saved:")
+    print(f"  Directory: {output_dir}")
+    print(f"  Files: {len(parquet_files)}")
+    print(f"  Documents: {num_docs:,}")
+    print(f"  Text size: {total_text_size / (1024*1024):.2f} MB")
+    print(f"  Compressed size: {total_compressed / (1024*1024):.2f} MB")
+    print(f"  Compression ratio: {total_text_size / total_compressed:.2f}x")
 
 
-def show_corpus_info(corpus_path: Path):
-    """Show detailed information about a corpus file."""
-    if not corpus_path.exists():
-        print(f"Error: {corpus_path} does not exist")
+def show_corpus_info(corpus_dir: Path):
+    """Show detailed information about a corpus directory."""
+    if not corpus_dir.exists():
+        print(f"Error: {corpus_dir} does not exist")
         sys.exit(1)
 
-    print(f"Corpus: {corpus_path}")
+    if not corpus_dir.is_dir():
+        print(f"Error: {corpus_dir} is not a directory")
+        sys.exit(1)
+
+    print(f"Corpus: {corpus_dir}")
     print()
 
-    with open(corpus_path, 'rb') as f:
-        corpus = pickle.load(f)
+    # Read metadata
+    metadata_file = corpus_dir / "_metadata.json"
+    if metadata_file.exists():
+        with open(metadata_file) as f:
+            metadata = json.load(f)
 
-    file_size = corpus_path.stat().st_size
-    total_text = sum(len(a) + len(t) + len(txt) for a, t, txt in corpus)
+        print("Metadata:")
+        print(f"  Documents: {metadata['num_documents']:,}")
+        print(f"  Text size: {metadata['text_size_mb']:.2f} MB")
+        print(f"  Files: {metadata['num_files']}")
+        print(f"  Target file size: {metadata.get('file_size_mb', 'N/A')} MB")
+        print()
 
-    # Gather statistics
-    authors = {}
-    for author, title, text in corpus:
-        authors[author] = authors.get(author, 0) + 1
+    # List Parquet files
+    parquet_files = sorted(corpus_dir.glob("part-*.parquet"))
+    total_size = sum(f.stat().st_size for f in parquet_files)
 
-    print(f"File size: {file_size / (1024*1024):.2f} MB")
-    print(f"Documents: {len(corpus):,}")
-    print(f"Text size: {total_text / (1024*1024):.2f} MB")
+    print(f"Parquet files: {len(parquet_files)}")
+    print(f"Total compressed size: {total_size / (1024*1024):.2f} MB")
+    if metadata_file.exists():
+        print(f"Compression ratio: {metadata['text_size_mb'] / (total_size / (1024*1024)):.2f}x")
     print()
 
-    print("Top authors:")
-    for author, count in sorted(authors.items(), key=lambda x: x[1], reverse=True)[:10]:
-        print(f"  {author:<40} {count:>6} documents")
+    # Read first file to show sample
+    if parquet_files:
+        print("Sample documents (from first file):")
+        table = pq.read_table(parquet_files[0])
+        df = table.to_pandas()
 
-    print()
-    print("Sample documents:")
-    for i, (author, title, text) in enumerate(corpus[:5], 1):
-        print(f"\n  {i}. {author} - {title}")
-        print(f"     Length: {len(text):,} chars")
-        print(f"     Preview: {text[:100].replace(chr(10), ' ')}...")
+        for i, row in df.head(5).iterrows():
+            print(f"\n  {i+1}. {row['author']} - {row['title']}")
+            print(f"     Length: {len(row['body']):,} chars")
+            print(f"     Preview: {row['body'][:100].replace(chr(10), ' ')}...")
 
 
 def main():
@@ -172,7 +226,7 @@ def main():
 
     # Info command
     info_parser = subparsers.add_parser('info', help='Show corpus information')
-    info_parser.add_argument('corpus', type=Path, help='Corpus file to inspect')
+    info_parser.add_argument('corpus', type=Path, help='Corpus directory to inspect')
 
     args = parser.parse_args()
 
@@ -184,19 +238,16 @@ def main():
         list_corpuses(args.folder)
 
     elif args.command == 'generate':
-        # Determine output path
+        # Determine output directory
         if args.output:
-            output_path = args.output
+            output_dir = args.output
         else:
-            output_path = args.folder / f"corpus_{int(args.size)}mb.pkl"
+            output_dir = args.folder / f"corpus_{int(args.size)}mb"
 
         # Determine cache directory
         cache_dir = args.cache_dir or (Path(__file__).parent / "gutenberg_cache")
 
-        # Create output folder if needed
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        generate_corpus_file(args.size, output_path, cache_dir)
+        generate_corpus_file(args.size, output_dir, cache_dir)
 
     elif args.command == 'info':
         show_corpus_info(args.corpus)
