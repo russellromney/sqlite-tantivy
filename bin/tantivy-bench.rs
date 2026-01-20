@@ -180,8 +180,12 @@ fn bench_database(cli: &Cli) -> Result<BenchmarkResult, Box<dyn std::error::Erro
         println!("  Loaded extension: {}", extension_path.display());
     }
 
-    // Get document count
-    let doc_count: usize = conn.query_row("SELECT COUNT(*) FROM articles", [], |row| row.get(0))?;
+    // Get document count (use MATCH for Tantivy compatibility)
+    let doc_count: usize = if cli.engine == "tantivy" {
+        conn.query_row("SELECT COUNT(*) FROM articles WHERE articles MATCH '*'", [], |row| row.get(0))?
+    } else {
+        conn.query_row("SELECT COUNT(*) FROM articles", [], |row| row.get(0))?
+    };
 
     // Calculate cache size based on logical DB size
     let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
@@ -272,7 +276,13 @@ fn collect_search_terms(
     }
 
     // Extract common words from titles for realistic search queries
-    let mut stmt = conn.prepare("SELECT title FROM articles LIMIT ?")?;
+    // For Tantivy, use MATCH clause; for FTS5, use regular SELECT
+    let sql = if engine == "tantivy" {
+        "SELECT title FROM articles WHERE articles MATCH '*' LIMIT ?"
+    } else {
+        "SELECT title FROM articles LIMIT ?"
+    };
+    let mut stmt = conn.prepare(sql)?;
     let mut terms = Vec::new();
 
     let rows = stmt.query_map([limit], |row| {

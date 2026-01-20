@@ -5,6 +5,7 @@ Cargo.lock
 
 # SQLite
 *.db
+*.db-tantivy
 *.db-journal
 *.db-shm
 *.db-wal
@@ -13,7 +14,10 @@ Cargo.lock
 benchmarks/corpus_*/
 benchmarks/gutenberg_cache/
 benchmarks/*.json
+benchmarks/*.log
 benchmarks/plots/
+benchmarks/uv.lock
+benchmarks/.venv/
 
 # IDE
 .idea/
@@ -27,3 +31,7 @@ benchmarks/plots/
 
 # Test artifacts
 /tmp/
+
+
+.db*
+.db-tantivy

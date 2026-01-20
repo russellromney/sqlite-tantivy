@@ -16,9 +16,8 @@ name = "tantivy-bench"
 path = "bin/tantivy-bench.rs"
 
 [dependencies]
-# Using forked version with INSERT fix until upstream PR is merged
-# See: https://github.com/asg017/sqlite-loadable-rs/pull/26
-sqlite-loadable = { git = "https://github.com/russellromney/sqlite-loadable-rs", branch = "fix-determine-update-operation-insert" }
+# Using local fork with INSERT fix + bind_blob/bind_null additions
+sqlite-loadable = { path = "../sqlite-loadable-rs" }
 tantivy = "0.22"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

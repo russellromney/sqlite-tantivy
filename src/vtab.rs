@@ -470,9 +470,10 @@ impl TantivyCursor {
         let searcher = reader.searcher();
 
         let tantivy_schema = index.schema();
+        let tokenizer_manager = index.tokenizers();
 
-        // Parse and execute the query
-        let query = parse_query(query_str, &tantivy_schema, &table.default_fields)
+        // Parse and execute the query (uses tokenizer for proper stemming)
+        let query = parse_query(query_str, &tantivy_schema, &table.default_fields, tokenizer_manager)
             .map_err(|e| sqlite_loadable::Error::new_message(e.to_string()))?;
 
         // Execute search
