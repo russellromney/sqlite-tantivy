@@ -296,6 +296,14 @@ def generate_database(corpus_dir: Path, output_path: Path, engine: str,
     # Clean up temp database
     temp_db_path.unlink()
 
+    # Enable WAL mode for better read concurrency
+    print(f"    Enabling WAL mode...")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+
+    # Checkpoint WAL to ensure data is in main database
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
     insert_time = time.time() - start_time
     print(f"  Done! Index built in {insert_time:.2f}s ({inserted_docs/insert_time:.0f} docs/sec)")
 

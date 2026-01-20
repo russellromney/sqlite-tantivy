@@ -11,6 +11,10 @@ categories = ["database", "text-processing"]
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "tantivy-bench"
+path = "bin/tantivy-bench.rs"
+
 [dependencies]
 # Using forked version with INSERT fix until upstream PR is merged
 # See: https://github.com/asg017/sqlite-loadable-rs/pull/26
@@ -24,9 +28,9 @@ parking_lot = "0.12"
 once_cell = "1.19"
 regex = "1.10"
 tantivy-common = "0.7"
+rusqlite = { version = "0.31", features = ["bundled", "load_extension"] }
 
 [dev-dependencies]
-rusqlite = { version = "0.31", features = ["bundled", "load_extension"] }
 tempfile = "3.0"
 
 [profile.release]
